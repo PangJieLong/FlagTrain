@@ -24,14 +24,17 @@ from flag_train.deepspeed import matmul_fp8_triton
 from .. import accuracy_utils as utils
 from ._fp8_gemm_utils import (
     ATOL,
+    BASE_M,
     CORE_GROUP_SIZE,
     CORE_K,
     CORE_M,
     CORE_N,
+    LARGE_M,
     assert_fp8_close,
     baseline_metadata,
     decode_custom_e4m3,
     deepspeed_matmul,
+    make_portable_inputs,
     make_quantized_inputs,
     original_deepspeed_skip_reason,
     strict_matmul_context,
@@ -44,14 +47,19 @@ DTYPES = (torch.bfloat16,)
 
 @pytest.fixture(scope="module", autouse=True)
 def fp8_environment():
-    if flag_train.vendor_name != "nvidia":
-        pytest.skip("FP8 GEMM integration currently targets NVIDIA only")
-    if not torch.cuda.is_available():
-        raise RuntimeError("NVIDIA FP8 GEMM tests require an available CUDA device")
-    metadata = baseline_metadata()  # required dependency: failures are not skipped
-    print("FP8_GEMM_BASELINE " + json.dumps(metadata, sort_keys=True))
+    if not utils.bf16_is_supported:
+        pytest.skip("The active backend does not support BF16")
     with strict_matmul_context():
-        yield metadata
+        yield
+
+
+@pytest.fixture(scope="module")
+def original_baseline():
+    # Only baseline comparisons depend on DeepSpeed; portable tests still run
+    # when this fixture fails. Missing/build-broken baselines never imply a pass.
+    metadata = baseline_metadata()
+    print("FP8_GEMM_BASELINE " + json.dumps(metadata, sort_keys=True))
+    return metadata
 
 
 @pytest.fixture(
@@ -64,51 +72,53 @@ def fp8_environment():
 )
 def core_case(request):
     m, dtype = request.param
-    x, weight, scale, fpq = make_quantized_inputs(
+    x, weight, scale = make_portable_inputs(
         m, CORE_K, CORE_N, dtype, CORE_GROUP_SIZE, flag_train.device
     )
-    # Also pin the arithmetic oracle to DeepSpeed's independent CUDA decoder.
-    # BF16 uses the exact dequantize + torch.matmul reference from upstream.
-    decoded = fpq.dequantize(weight, scale=fpq.scale)
-    reference = torch.matmul(x, decoded)
-    mathematical = decode_custom_e4m3(weight, scale, CORE_GROUP_SIZE, dtype)
-    utils.train_assert_equal(
-        utils.to_reference(mathematical), utils.to_reference(decoded)
-    )
-    del mathematical, decoded
-    return m, dtype, x, weight, scale, fpq, reference
+    reference = torch_reference(x, weight, scale, CORE_GROUP_SIZE)
+    return x, weight, scale, reference
 
 
-def test_fp8_gemm_candidate_vs_torch(core_case):
+def test_fp8_gemm_candidate_vs_torch(core_case, record_property):
     """All 15 BF16 candidate shapes run, including the four baseline skips."""
-    _, _, x, weight, scale, _, reference = core_case
+    x, weight, scale, reference = core_case
+    record_property("shape_group", "large-m" if x.shape[0] in LARGE_M else "base")
     actual = matmul_fp8_triton(x, weight, scale, CORE_GROUP_SIZE)
     assert_fp8_close(actual, reference)
 
 
-def test_fp8_gemm_against_original_deepspeed(
-    core_case, fp8_environment, record_property
-):
+@pytest.mark.parametrize("m", CORE_M)
+def test_fp8_gemm_against_original_deepspeed(m, original_baseline, record_property):
     """Compare to unmodified DeepSpeed where its pinned implementation runs.
 
     ``original_deepspeed_skip_reason`` is deliberately consulted before the
     DeepSpeed call.  It covers only the pinned upstream resource limit;
     the candidate has already been checked against the independent oracle above.
     """
-    m, dtype, x, weight, scale, fpq, reference = core_case
+    dtype = torch.bfloat16
+    record_property("shape_group", "large-m" if m in LARGE_M else "base")
     reason = original_deepspeed_skip_reason(
         m,
         CORE_K,
         CORE_N,
         dtype,
         CORE_GROUP_SIZE,
-        x.device,
-        metadata=fp8_environment,
+        flag_train.device,
+        metadata=original_baseline,
     )
     if reason:
         pytest.skip(reason)
     record_property("baseline_mode", "original")
-    record_property("baseline_metadata", json.dumps(fp8_environment, sort_keys=True))
+    record_property("baseline_metadata", json.dumps(original_baseline, sort_keys=True))
+    x, weight, scale, fpq = make_quantized_inputs(
+        m, CORE_K, CORE_N, dtype, CORE_GROUP_SIZE, flag_train.device
+    )
+    decoded = fpq.dequantize(weight, scale=fpq.scale)
+    mathematical = decode_custom_e4m3(
+        utils.to_reference(weight), utils.to_reference(scale), CORE_GROUP_SIZE, dtype
+    )
+    utils.train_assert_equal(mathematical, utils.to_reference(decoded))
+    reference = torch.matmul(utils.to_reference(x), utils.to_reference(decoded))
     actual = matmul_fp8_triton(x, weight, scale, CORE_GROUP_SIZE)
     original = deepspeed_matmul(x, weight, scale, CORE_GROUP_SIZE, fpq)
     assert_fp8_close(actual, reference)
@@ -135,7 +145,9 @@ EDGE_CASES = (
 def test_fp8_gemm_oracle_contract():
     codes = torch.arange(256, device=flag_train.device).to(torch.uint8).reshape(1, 256)
     scale = torch.tensor([1 / 128], dtype=torch.float32, device=flag_train.device)
-    values = decode_custom_e4m3(codes, scale, 256, torch.float64).reshape(-1)
+    values = decode_custom_e4m3(
+        utils.to_reference(codes), utils.to_reference(scale), 256, torch.float32
+    ).reshape(-1)
     assert values[0].item() == math.ldexp(1.0, -14)  # not zero/subnormal
     assert values[120].item() == 2.0  # exponent 15 is finite
     assert values[127].item() == 3.75
@@ -149,8 +161,9 @@ def test_fp8_gemm_oracle_contract():
     "name,m,k,n,group_size", EDGE_CASES, ids=[c[0] for c in EDGE_CASES]
 )
 def test_fp8_gemm_edges(name, m, k, n, group_size, dtype):
-    device = flag_train.device
-    generator = torch.Generator(device=device).manual_seed(20260922)
+    # Build the same bytes on every vendor, including those without device RNG.
+    device = "cpu"
+    generator = torch.Generator(device="cpu").manual_seed(20260922)
     shape = (k, m) if name == "noncontiguous_activation" else (m, k)
     x = (torch.randn(shape, device=device, generator=generator) * 0.5).to(dtype)
     if name == "noncontiguous_activation":
@@ -180,6 +193,7 @@ def test_fp8_gemm_edges(name, m, k, n, group_size, dtype):
     # Cover both the usual [groups, 1] layout and a flat scale tensor.
     if name != "group_crosses_n_tile":
         scales = scales.reshape(groups, 1)
+    x, weight, scales = (t.to(flag_train.device) for t in (x, weight, scales))
     reference = torch_reference(x, weight, scales, group_size)
     actual = matmul_fp8_triton(x, weight, scales, group_size)
     if name in ("all_256_codes", "zero_scale", "empty_m", "empty_n", "empty_k"):
@@ -189,7 +203,7 @@ def test_fp8_gemm_edges(name, m, k, n, group_size, dtype):
     elif name == "large_decoded_range":
         # Retain the predeclared standalone large-range policy, not an observed
         # error-derived tolerance. Atol grows with the reference RMS only here.
-        rms = reference.double().square().mean().sqrt().item()
+        rms = reference.cpu().double().square().mean().sqrt().item()
         factor = 0.004 if dtype == torch.bfloat16 else 0.0005
         assert bool(torch.isfinite(actual).all())
         utils.train_assert_close(
@@ -261,3 +275,38 @@ def test_fp8_gemm_invalid_inputs(case, error):
         scale = torch.full((8,), 1 / 128, dtype=torch.float32, device=device)[::2]
     with pytest.raises(error):
         matmul_fp8_triton(x, weight, scale, group)
+
+
+@pytest.mark.parametrize("vendor", ("ascend", "hygon", "thead", "metax"))
+def test_fp8_gemm_h20_skip_is_nvidia_only(monkeypatch, vendor):
+    """Policy test, not evidence of execution on the named hardware."""
+    monkeypatch.setattr(flag_train, "vendor_name", vendor)
+    assert len(BASE_M) == 11 and len(LARGE_M) == 4
+    assert set(CORE_M) == set(BASE_M) | set(LARGE_M)
+    assert not set(BASE_M) & set(LARGE_M)
+    assert (
+        original_deepspeed_skip_reason(
+            256,
+            CORE_K,
+            CORE_N,
+            torch.bfloat16,
+            CORE_GROUP_SIZE,
+            flag_train.device,
+            metadata={},
+        )
+        is None
+    )
+
+
+def test_fp8_gemm_portable_path_without_deepspeed(monkeypatch):
+    from . import _fp8_gemm_utils as helpers
+
+    def forbidden():
+        raise AssertionError("Portable correctness must not load DeepSpeed")
+
+    monkeypatch.setattr(helpers, "load_deepspeed", forbidden)
+    x, weight, scale = make_portable_inputs(
+        17, 133, 77, torch.bfloat16, 17, flag_train.device
+    )
+    actual = matmul_fp8_triton(x, weight, scale, 17)
+    assert_fp8_close(actual, torch_reference(x, weight, scale, 17))

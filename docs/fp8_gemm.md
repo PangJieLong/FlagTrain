@@ -1,4 +1,4 @@
-# DeepSpeed FP8 GEMM — BF16 validation
+# DeepSpeed FP8 GEMM — portable BF16 validation
 
 Implementation: `src/flag_train/deepspeed/fp8_gemm_triton.py`, exported as
 `flag_train.deepspeed.matmul_fp8_triton(x, weight, scale, quantization_group_size)`.
@@ -9,22 +9,70 @@ index flattened `[K, N]` elements. Production code imports no DeepSpeed helpers.
 
 ## Current acceptance scope
 
-This suite validates **BF16 only on NVIDIA**, following the LAMB component test
-and `GenericBenchmark` structure. Existing FP16 entry points are not covered by
-this acceptance result. Other backends, gradients and end-to-end training are
-outside this report.
+The generic implementation and shared BF16 tests use FlagTrain's active device
+and public component API, following the LAMB and `GenericBenchmark` structure.
+There is no NVIDIA-only entry guard or vendor-wide test skip. NVIDIA is the
+only hardware on which this contribution has been measured; Ascend (`ascend`),
+Hygon (`hygon`), T-Head (`thead`), MetaX (`metax`) and other backends are **pending
+hardware validation**, not claimed supported or fast merely by collecting tests.
+Existing FP16 entry points, gradients and end-to-end training are not covered.
 
 The baseline is the **unmodified** public API
 `deepspeed.ops.fp_quantizer.matmul_fp8`. No replacement kernels, launch overrides,
-scale padding or fallback baseline are installed. Missing dependencies are errors.
+scale padding or fallback baseline are installed. Missing dependencies are errors
+in original-baseline tests, not a reason to silently substitute torch. Portable
+candidate correctness tests do not import or require DeepSpeed.
+
+## Cross-platform workflow
+
+1. Install the target vendor's PyTorch/Triton stack and FlagTrain, then verify
+   `flag_train.vendor_name` and `flag_train.device`. Use the same public import
+   `from flag_train.deepspeed import matmul_fp8_triton` on every backend.
+2. Run portable correctness (all 15 core shapes plus edge/contract tests):
+   `python -m pytest tests/deepspeed/test_fp8_gemm.py -q -ra -k "not against_original_deepspeed"`.
+   Add `--ref cpu` to execute decoding and reference matmul on CPU, not simply
+   copy a reference result computed on the accelerator.
+3. Install/build original DeepSpeed's FP quantizer for that platform, then run
+   the full correctness and default performance commands below. Baseline build,
+   execution and numerical failures remain visible failures. Only the narrowly
+   identified NVIDIA H20 limitation below is skipped.
+4. If the baseline is not yet available, obtain diagnostic candidate latency:
+   `python -m pytest benchmark/deepspeed/test_fp8_gemm.py -q -s --mode=kernel --metrics latency --record=json --output=/tmp/fp8_latency.json`.
+   This explicitly bypasses DeepSpeed and uses portable encoded inputs. Reports
+   contain **no baseline latency or speedup** and mark acceptance as not evaluated.
+   A passing latency-only run is not a pass against the requested 0.8x floor.
+5. Reuse the generic kernel if correctness and original-baseline performance both
+   pass. If compilation, correctness or performance fails, investigate it and
+   add a vendor implementation through the existing backend registration, not a
+   copy of the test suite or a broad skip.
+
+Vendor implementations can follow the existing Hygon component layout under
+`src/flag_train/runtime/backend/_<vendor>/ops/deepspeed/`. Re-export the same
+`matmul_fp8_triton` name in that package's `__init__.py` and include it in
+`__all__`; the runtime discovers the backend ops package and its subpackages.
+`SpecOpRegistrar` in `flag_train.deepspeed` replaces the generic export when an
+override exists; both test suites call that public export. No untested vendor
+implementation or per-vendor tuning claim is added by this refactor.
+
+Device guards and synchronization use `torch_device_fn`. Kernel-mode timing is
+selected by the shared benchmark framework: `do_bench_npu` on Ascend and
+`triton.testing.do_bench` on the other configured paths. NVIDIA precision and
+shared-memory workarounds are not applied to NPU or other vendors indiscriminately.
+Devices declared unable to run BF16 are explicitly skipped, not reported as passed.
 
 All core shapes use `K=4096`, `N=8192`, `quantization_group_size=128`:
 
-| Origin | M | Treatment on the pinned environment |
+| Group | M | Default behavior on every platform |
 | --- | --- | --- |
-| Upstream, supported | 1, 2, 4, 8, 32, 64, 128 | Original baseline comparison and timing |
-| Upstream, resource-limited | 256, 512, 1024, 2048 | Baseline skip; candidate still tested independently |
-| Supplemental | 16, 17, 48, 96 | Original baseline comparison and timing |
+| Common base (7 upstream + 4 supplemental) | 1, 2, 4, 8, 16, 17, 32, 48, 64, 96, 128 | Attempt original baseline comparison and timing |
+| Large-M extension (upstream) | 256, 512, 1024, 2048 | Also attempt original baseline comparison and timing; only confirmed limitations may skip |
+
+Both groups run by default. A `shape_group` label distinguishes them in benchmark
+case plans, timing-row provenance and pytest/JUnit properties (the shared accuracy
+JSON does not serialize these properties); it does not disable large shapes. All 15
+candidate shapes run against the torch reference. H20/Triton 3.6 baseline
+resource skips below are **not** copied to Ascend, Hygon, T-Head or MetaX.
+Passing the base group does not establish large-M performance acceptance.
 
 Supplemental shapes were chosen before timing: M=16/17 exercises a tile-size
 boundary, while M=48/96 exercises partial tiles. Shapes are not removed for
@@ -46,11 +94,17 @@ not 15 baseline passes.
 
 ## Correctness
 
-Every candidate core shape is checked against upstream's reference:
-`torch.matmul(x, fpq.dequantize(weight, scale=fpq.scale))`. An independent
-arithmetic E4M3 decoder must also match DeepSpeed's CUDA decoder. For usable
-baseline shapes, original DeepSpeed is checked against this reference and the
-candidate is compared directly to original DeepSpeed.
+Every candidate core shape uses deterministic CPU-generated custom E4M3 bytes,
+scales and activations, transferred to the active backend. The independent
+arithmetic decoder uses FP32 (no accelerator FP64 requirement) and checks the
+candidate against torch matmul. These bytes are test inputs, not an alternative
+DeepSpeed quantizer or performance acceptance baseline.
+
+Separate original-baseline tests use actual DeepSpeed quantization and upstream's
+reference `torch.matmul(x, fpq.dequantize(weight, scale=fpq.scale))`. The independent
+decoder must also exactly match DeepSpeed's decoder; both implementations are
+checked against the reference and compared directly with each other. Under
+`--ref cpu`, reference operands are moved before the decoder and matmul execute.
 
 Repository `train_assert_close` ultimately uses `torch.testing.assert_close`:
 BF16 rtol=0.016 and fixed atol=0.025. Core checks retain upstream's native-dtype
@@ -59,9 +113,10 @@ as an additional stable assertion. Neither check replaces a failed assertion.
 There are also 25 candidate-only edge/oracle/invalid-input checks; these do not
 claim that the original wrapper supports the extended input contracts.
 
-The functional suite collects 55 nodes: 15 candidate core checks, 15 original
-baseline checks and 25 edge/oracle/invalid-input checks. Expected outcomes on
-the pinned environment are 51 passed and four skipped.
+The functional suite additionally checks that four non-NVIDIA vendor identities
+cannot inherit the H20 skip and that a portable candidate case never loads
+DeepSpeed. Vendor-identity policy tests are not hardware execution tests.
+In total there are 60 nodes: 45 portable checks and 15 original-baseline checks.
 
 ## Performance
 
@@ -72,8 +127,9 @@ consume identical inputs. Quantization, reference construction and correctness
 checks occur outside timing. Every measured case must satisfy
 `DeepSpeed_latency / FlagTrain_latency > 0.8`; a lower result fails, not skips.
 
-The JSON retains all 15 pytest outcomes and the 11 measured rows; skipped cases
-have no speedup. `--list-cases` lists all shapes without loading DeepSpeed.
+The JSON retains all 15 pytest outcomes and all actually measured rows (11 on
+the pinned H20 stack; potentially 15 elsewhere); skipped cases have no speedup.
+`--list-cases` lists all shapes without loading DeepSpeed.
 `--case-id` supports an explicit known skip and still rejects unknown IDs.
 
 ## Commands
@@ -101,7 +157,7 @@ DeepSpeed build adaptations permit Triton 3.6 and rename a CUDA translation unit
 to avoid duplicate object names. They do not modify the GEMM kernel or launch
 and are not part of this FlagTrain contribution.
 
-## Measured acceptance (2026-10-14)
+## Original NVIDIA acceptance before portability refactor (2026-10-14)
 
 The contribution was integrated onto FlagTrain main commit
 `e4abdf01b4490f5dc2522577922bc8ec50e0be2f` and revalidated through the component
@@ -148,3 +204,53 @@ Raw logs and JSON are retained outside the repository at
 `/workspace/fp8_gemm_dev/results/nv_submission_20261014/`, including
 `accuracy.json`, `benchmark.json`, `memcheck.log` and `other_ops.log`.
 Previous mixed-baseline results are not evidence for this BF16-only acceptance.
+
+## Portability refactor regression (2026-10-14)
+
+On the same NVIDIA H20 stack, after removing the vendor-only gate and separating
+portable tests from baseline tests:
+
+- Device-reference correctness: **56 passed, 4 skipped**.
+- `--ref cpu` correctness: **56 passed, 4 skipped**; reference computation runs on CPU.
+- Original-DeepSpeed performance, two complete runs: **11 passed, 4 skipped** each;
+  ratios **0.920329x–1.651016x** and **0.910532x–1.646170x**. Every measured case
+  remains above 0.8x, not necessarily above 1x.
+- With all DeepSpeed imports deliberately blocked, portable correctness:
+  **45 passed, 15 deselected**; explicit latency-only benchmarking: **15 passed**.
+  All 15 recorded latency-only rows have no baseline latency and no speedup;
+  the JSON explicitly says DeepSpeed speedup acceptance was not evaluated.
+- The same missing-DeepSpeed harness fails an original-baseline test as expected:
+  there is no implicit replacement baseline or false acceptance pass.
+- LAMB and packbits regression: **106 passed**.
+- Repository-configured Black, isort and flake8 checks passed.
+
+Evidence is outside the source tree at
+`/workspace/fp8_gemm_dev/results/nv_portability_20261014/`. The initial CPU-reference
+oracle-contract test revealed a device-placement assertion, which was fixed and
+the entire CPU-reference suite rerun; the final results above supersede that
+initial attempt. No numerical threshold was relaxed. The five additional policy
+and dependency-isolation tests are not a substitute for real Ascend/Hygon/T-Head/
+MetaX validation. Run the same commands on those platforms before reporting support.
+
+## Base + large-M regression (2026-10-18)
+
+Both groups remain enabled by default. On the pinned NVIDIA H20 environment:
+
+- Full device-reference and full CPU-reference correctness each completed with
+  **56 passed, 4 skipped**. All 15 candidate shapes passed; the four skips remain
+  the narrowly identified original-baseline resource limitation.
+- Two final original-DeepSpeed performance runs each completed with **11 passed,
+  4 skipped**, at **0.912847x–1.640266x** and **0.910271x–1.643422x**. All measured
+  ratios exceeded 0.8x. Large-M speedup is still unmeasured on this H20 baseline.
+- With DeepSpeed imports blocked, **45 portable correctness checks passed** and
+  all **15 candidate-only timing cases passed**. Baseline acceptance still fails
+  when its required dependency is missing; diagnostic rows have no baseline or
+  speedup and explicitly label acceptance as not evaluated.
+- Sanitizer: **30 checks passed, 0 errors**. LAMB + packbits: **106 passed**.
+- Report/case-ID checks and repository-configured formatting/lint checks passed.
+
+Final evidence is retained at
+`/workspace/fp8_gemm_dev/results/nv_portability_20261018/`. Neither policy tests
+using vendor names nor NVIDIA regressions count as execution on other hardware.
+The proposed uniform exclusion of large shapes was not adopted: other vendors
+must attempt the large-M original baseline and report the actual outcome.

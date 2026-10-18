@@ -23,7 +23,8 @@ Both timed calls consume the same quantized weights, scales, and activations;
 both allocate their output in the timed call. Quantization, the mathematical
 oracle, and three-way correctness checks happen before timing. NVIDIA kernel
 mode in ``GenericBenchmark`` uses ``triton.testing.do_bench``. Every measured
-case must exceed 0.8x speedup.
+acceptance case must exceed 0.8x speedup. Explicit ``--metrics latency`` is a
+portable candidate-only diagnostic, never a DeepSpeed speedup acceptance run.
 """
 
 import json
@@ -34,18 +35,22 @@ import torch
 
 import flag_train
 from flag_train.deepspeed import matmul_fp8_triton
+from flag_train.runtime import torch_device_fn
 from tests.deepspeed._fp8_gemm_utils import (
     CORE_GROUP_SIZE,
     CORE_K,
     CORE_M,
     CORE_N,
+    LARGE_M,
     SUPPLEMENTAL_M,
     assert_fp8_close,
     baseline_metadata,
     deepspeed_matmul,
+    make_portable_inputs,
     make_quantized_inputs,
     original_deepspeed_skip_reason,
     strict_matmul_context,
+    torch_reference,
 )
 
 from .. import base
@@ -70,7 +75,8 @@ _PYTEST_CASES = tuple(
 )
 
 pytestmark = pytest.mark.skipif(
-    flag_train.vendor_name != "nvidia", reason="FP8 GEMM currently targets NVIDIA"
+    not flag_train.runtime.device.support_bf16,
+    reason="The active backend does not support BF16",
 )
 
 
@@ -87,6 +93,7 @@ class Fp8GemmBenchmark(base.GenericBenchmark):
 
     def __init__(self, *, selected_shape, **kwargs):
         self._selected_shape = tuple(selected_shape)
+        self.candidate_only = False
         super().__init__(**kwargs)
 
     def set_shapes(self, shape_file=None):
@@ -102,7 +109,10 @@ class Fp8GemmBenchmark(base.GenericBenchmark):
         if base.Config.query or base.Config.list_cases:
             return
         if base.Config.mode != base.consts.BenchMode.KERNEL:
-            raise ValueError("FP8 GEMM acceptance requires --mode kernel (do_bench)")
+            raise ValueError("FP8 GEMM requires --mode kernel (backend timer)")
+        self.candidate_only = set(self.to_bench_metrics) == {"latency"}
+        if self.candidate_only:
+            return
         if base.Config.skip_native:
             raise ValueError("FP8 GEMM acceptance requires the DeepSpeed baseline")
         if not _REQUIRED_METRICS.issubset(self.to_bench_metrics):
@@ -115,7 +125,35 @@ class Fp8GemmBenchmark(base.GenericBenchmark):
         plan = case.builder_args[0]
         m, k, n = plan.builder_args
         group_size = plan.params["group_size"]
+        if self.candidate_only:
+            x, weight, scale = make_portable_inputs(
+                m, k, n, case.dtype, group_size, self.device
+            )
+            actual = matmul_fp8_triton(x, weight, scale, group_size)
+            with strict_matmul_context():
+                assert_fp8_close(actual, torch_reference(x, weight, scale, group_size))
+            torch_device_fn.synchronize()
+            return (
+                x,
+                weight,
+                scale,
+                group_size,
+                {
+                    "fpq": None,
+                    "baseline_label": json.dumps(
+                        {
+                            "mode": "candidate-only",
+                            "acceptance": "not-evaluated",
+                            "baseline": None,
+                            "vendor": flag_train.vendor_name,
+                            "shape_group": "large-m" if m in LARGE_M else "base",
+                        },
+                        sort_keys=True,
+                    ),
+                },
+            )
         metadata = baseline_metadata()
+        metadata["shape_group"] = "large-m" if m in LARGE_M else "base"
         reason = original_deepspeed_skip_reason(
             m,
             k,
@@ -142,17 +180,34 @@ class Fp8GemmBenchmark(base.GenericBenchmark):
         metric = super()._measure_input(inputs, case_id=case_id)
         label = case_id or str(metric.shape_detail)
         assert metric.error_msg is None, f"{label}: {metric.error_msg}"
-        for name in _REQUIRED_METRICS:
+        required = {"latency"} if self.candidate_only else _REQUIRED_METRICS
+        for name in required:
             value = getattr(metric, name)
             assert (
                 value is not None and math.isfinite(value) and value > 0
             ), f"{label}: invalid {name}={value!r}"
+        if self.candidate_only:
+            assert metric.latency_base is None and metric.speedup is None
+            return metric
         # Verify the actual ratio as well as the framework's EPS-adjusted ratio.
         ratio = metric.latency_base / metric.latency
         assert (
             ratio > _MIN_SPEEDUP and metric.speedup > _MIN_SPEEDUP
         ), f"{label}: speedup {ratio:.6f}x must be > {_MIN_SPEEDUP}x"
         return metric
+
+    def _emit_result(self, dtype, metrics):
+        if not self.candidate_only:
+            return super()._emit_result(dtype, metrics)
+        previous = base.Config.native_baseline_skip_reason
+        base.Config.native_baseline_skip_reason = (
+            "Explicit --metrics latency: candidate-only diagnostic; "
+            "DeepSpeed speedup acceptance NOT evaluated"
+        )
+        try:
+            return super()._emit_result(dtype, metrics)
+        finally:
+            base.Config.native_baseline_skip_reason = previous
 
 
 def fp8_gemm_case_fn(shape, dtype):
@@ -167,8 +222,13 @@ def fp8_gemm_case_fn(shape, dtype):
         shape={"activation": (m, k), "weight": (k, n)},
         params={
             "group_size": _GROUP_SIZE,
-            "baseline": "deepspeed-original",
+            "baseline": (
+                "none-candidate-only"
+                if set(base.Config.user_desired_metrics or ()) == {"latency"}
+                else "deepspeed-original"
+            ),
             "shape_origin": "supplemental" if m in SUPPLEMENTAL_M else "upstream",
+            "shape_group": "large-m" if m in LARGE_M else "base",
             "original_deepspeed_check": "known-check-runtime",
         },
         builder_args=(m, k, n),
@@ -186,7 +246,7 @@ def fp8_gemm_build_inputs(plan, dtype, device, metadata):
     assert_fp8_close(candidate, reference)
     assert_fp8_close(baseline, reference)
     assert_fp8_close(candidate, baseline, mean_relative=False)
-    torch.cuda.synchronize(x.device)
+    torch_device_fn.synchronize()
 
     # The framework drops unknown positional object types. Keep the quantizer
     # in kwargs, and persist the original-baseline identity in recorded inputs.

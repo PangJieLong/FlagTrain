@@ -2,7 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Shared FP8 GEMM test/benchmark oracles; never imported by production code.
 
-The only baseline is the unmodified DeepSpeed FP8 GEMM public API. Known upstream
+Portable inputs and the torch oracle do not require DeepSpeed. The only
+performance acceptance baseline is the unmodified DeepSpeed public API. Known upstream
 limitations have a source/version/device-scoped skip policy. No kernel, launch
 configuration or input storage is patched. Unexpected failures remain failures.
 """
@@ -24,6 +25,8 @@ UPSTREAM_M = (1, 2, 4, 8, 32, 64, 128, 256, 512, 1024, 2048)
 # These supplement, rather than erase, the original unsupported cases.
 SUPPLEMENTAL_M = (16, 17, 48, 96)
 CORE_M = tuple(sorted(UPSTREAM_M + SUPPLEMENTAL_M))
+LARGE_M = (256, 512, 1024, 2048)
+BASE_M = tuple(m for m in CORE_M if m not in LARGE_M)
 CORE_K = 4096
 CORE_N = 8192
 CORE_GROUP_SIZE = 128
@@ -36,8 +39,6 @@ KNOWN_FP8_SOURCE_SHA256 = (
 @functools.lru_cache(maxsize=1)
 def load_deepspeed():
     """Load the required independent implementation, without a skip/fallback."""
-    if flag_train.vendor_name != "nvidia":
-        raise RuntimeError("The current FP8 GEMM baseline suite requires NVIDIA CUDA")
     try:
         import deepspeed
         from deepspeed.linear import QuantizationConfig
@@ -46,7 +47,7 @@ def load_deepspeed():
         module = importlib.import_module("deepspeed.ops.fp_quantizer.fp8_gemm_triton")
     except Exception as exc:
         raise RuntimeError(
-            "DeepSpeed FP8 GEMM is a required baseline on NVIDIA. Install/build "
+            "DeepSpeed FP8 GEMM is required for original-baseline acceptance. Install/build "
             "DeepSpeed with DS_BUILD_FP_QUANTIZER=1; no replacement oracle is "
             f"selected automatically. Original error: {exc!r}"
         ) from exc
@@ -66,6 +67,8 @@ def baseline_metadata():
         commit = None
     return {
         "mode": "original",
+        "vendor": flag_train.vendor_name,
+        "device": str(flag_train.device),
         "deepspeed_version": deepspeed.__version__,
         "deepspeed_commit": commit,
         "deepspeed_source": str(source),
@@ -78,6 +81,9 @@ def baseline_metadata():
         "validation_dtype": "torch.bfloat16",
         "upstream_m": UPSTREAM_M,
         "supplemental_m": SUPPLEMENTAL_M,
+        "base_m": BASE_M,
+        "large_m": LARGE_M,
+        "comparison_scope": "base-and-large; all shapes attempted on every vendor",
         "assertion": "BF16 train_assert_close rtol=.016/atol=.025 and upstream relative error <.004",
     }
 
@@ -85,15 +91,21 @@ def baseline_metadata():
 @contextlib.contextmanager
 def strict_matmul_context():
     """Keep reference FP32 accumulation precise and restore process settings."""
+    # These precision controls belong to CUDA/ROCm, not every PrivateUse1 backend.
+    if torch.device(flag_train.device).type != "cuda":
+        yield
+        return
     names = (
         "allow_tf32",
         "allow_fp16_reduced_precision_reduction",
         "allow_bf16_reduced_precision_reduction",
     )
     backend = torch.backends.cuda.matmul
-    previous = {name: getattr(backend, name) for name in names}
+    previous = {
+        name: getattr(backend, name) for name in names if hasattr(backend, name)
+    }
     try:
-        for name in names:
+        for name in previous:
             setattr(backend, name, False)
         yield
     finally:
@@ -109,15 +121,13 @@ def original_deepspeed_skip_reason(m, k, n, dtype, group_size, device, metadata=
     the four measured BF16 resource failures on H20/Triton 3.6 are excluded;
     numerical failures and candidate failures are never converted to skips.
     """
+    # CUDA-compatible APIs on other vendors do not imply the H20 resource limit.
+    if flag_train.vendor_name != "nvidia":
+        return None
     metadata = baseline_metadata() if metadata is None else metadata
     if metadata["deepspeed_source_sha256"] != KNOWN_FP8_SOURCE_SHA256:
         return None
-    if (k, n, group_size) != (CORE_K, CORE_N, CORE_GROUP_SIZE) or m not in (
-        256,
-        512,
-        1024,
-        2048,
-    ):
+    if (k, n, group_size) != (CORE_K, CORE_N, CORE_GROUP_SIZE) or m not in LARGE_M:
         return None
     version = metadata["triton_version"]
     if dtype == torch.bfloat16 and m >= 256 and version.startswith("3.6."):
@@ -149,6 +159,22 @@ def make_quantized_inputs(m, k, n, dtype, group_size, device):
     return x, weight, scale, fpq
 
 
+def make_portable_inputs(m, k, n, dtype, group_size, device):
+    """Fixed CPU-generated encoded inputs; no vendor RNG or quantizer dependency.
+
+    These are valid custom E4M3 bytes, not a replacement for DeepSpeed's
+    quantizer. Original-baseline acceptance continues to use its real quantizer.
+    """
+    generator = torch.Generator(device="cpu").manual_seed(20260922)
+    x = torch.randn(m, k, generator=generator).to(dtype)
+    magnitude = torch.randint(32, 88, (k, n), generator=generator, dtype=torch.int32)
+    sign = torch.randint(0, 2, (k, n), generator=generator, dtype=torch.int32)
+    weight = (magnitude | (sign << 7)).to(torch.uint8)
+    groups = (k * n + group_size - 1) // group_size
+    scale = 0.125 + 0.125 * torch.rand(groups, 1, generator=generator)
+    return x.to(device), weight.to(device), scale.to(device)
+
+
 def deepspeed_matmul(x, weight, scale, group_size, fpq):
     """Call the original public baseline API without any kernel substitution."""
     return load_deepspeed()[3](x, weight, scale, group_size, fpq)
@@ -165,14 +191,17 @@ def decode_custom_e4m3(weight, scale, group_size, dtype):
     decoded = torch.empty_like(weight, dtype=dtype)
     scales = scale.reshape(-1)
     for start in range(0, k, 128):
-        codes = weight[start : start + 128].to(torch.int64)
-        sign = 1.0 - 2.0 * ((codes >> 7) & 1).to(torch.float64)
-        exponent = ((codes >> 3) & 15).to(torch.float64)
-        mantissa = (codes & 7).to(torch.float64)
+        codes = weight[start : start + 128].to(torch.int32)
+        sign = 1.0 - 2.0 * ((codes >> 7) & 1).to(torch.float32)
+        exponent = ((codes >> 3) & 15).to(torch.float32)
+        mantissa = (codes & 7).to(torch.float32)
         unscaled = sign * (1.0 + mantissa / 8.0) * torch.exp2(exponent - 7.0)
         groups = (
             torch.arange(
-                start * n, start * n + codes.numel(), device=weight.device
+                start * n,
+                start * n + codes.numel(),
+                device=weight.device,
+                dtype=torch.int32,
             ).reshape_as(codes)
             // group_size
         )
@@ -184,6 +213,10 @@ def decode_custom_e4m3(weight, scale, group_size, dtype):
 
 
 def torch_reference(x, weight, scale, group_size):
+    from .. import accuracy_utils as utils
+
+    # --ref cpu must move operands before decoding/matmul, not just the result.
+    x, weight, scale = (utils.to_reference(t) for t in (x, weight, scale))
     decoded = decode_custom_e4m3(weight, scale, group_size, x.dtype)
     return (x.float() @ decoded.float()).to(x.dtype)
 
@@ -197,6 +230,7 @@ def assert_fp8_close(actual, reference, *, mean_relative=True):
     """
     from .. import accuracy_utils as utils
 
+    actual, reference = utils.to_reference(actual), utils.to_reference(reference)
     assert bool(
         torch.isfinite(actual).all()
     ), "candidate/baseline contains nonfinite values"

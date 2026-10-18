@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Fused DeepSpeed FP8-weight GEMM for NVIDIA GPUs.
+"""Generic Triton implementation of DeepSpeed's FP8-weight GEMM.
 
 Weights use DeepSpeed's custom uint8 E4M3 encoding, not torch.float8_e4m3fn.
 The scale tensor is the float32 tensor returned by FP_Quantize.get_scales().
@@ -118,8 +118,15 @@ def _validate(inp, weight, scale, group_size):
         raise TypeError(
             "weight must be uint8; scales must be float32 from get_scales()"
         )
-    if not inp.is_cuda or weight.device != inp.device or scale.device != inp.device:
-        raise ValueError("input, weight and scales must be on the same CUDA device")
+    if (
+        inp.device.type == "cpu"
+        or inp.device.type != torch.device(flag_train.device).type
+        or weight.device != inp.device
+        or scale.device != inp.device
+    ):
+        raise ValueError(
+            "input, weight and scales must be on the active backend device"
+        )
     if not weight.is_contiguous() or not scale.is_contiguous():
         raise ValueError("weight and scales must be contiguous")
     if (
@@ -179,10 +186,6 @@ def matmul_fp8_triton(inp, weight, scale, quantization_group_size):
     dequantization workspace, output cache, or host-device copy is used.
     """
     logger.debug("TRAIN FP8 GEMM")
-    if flag_train.vendor_name != "nvidia":
-        raise NotImplementedError(
-            "fp8_gemm_triton is currently validated only on NVIDIA"
-        )
     _validate(inp, weight, scale, quantization_group_size)
     return _launch(inp, weight, scale, quantization_group_size)
 
