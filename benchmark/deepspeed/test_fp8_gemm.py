@@ -11,7 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""FP8 GEMM performance against the unmodified DeepSpeed public API.
+"""FP8 GEMM performance against the explicitly selected platform baseline.
+
+Ascend uses Torch eager dequantization + BF16 matmul, including the complete
+dequantization in each timed invocation. Other vendors retain original
+DeepSpeed matmul_fp8 with its real quantizer. There is no automatic fallback.
 
 Each ``(M, dtype)`` pair is an individual pytest node instead of one opaque
 benchmark entry. On a stack for which the original DeepSpeed kernel is known
@@ -24,7 +28,7 @@ both allocate their output in the timed call. Quantization, the mathematical
 oracle, and three-way correctness checks happen before timing. NVIDIA kernel
 mode in ``GenericBenchmark`` uses ``triton.testing.do_bench``. Every measured
 acceptance case must exceed 0.8x speedup. Explicit ``--metrics latency`` is a
-portable candidate-only diagnostic, never a DeepSpeed speedup acceptance run.
+portable candidate-only diagnostic, never a baseline speedup acceptance run.
 """
 
 import json
@@ -44,10 +48,10 @@ from tests.deepspeed._fp8_gemm_utils import (
     LARGE_M,
     SUPPLEMENTAL_M,
     assert_fp8_close,
+    baseline_matmul,
     baseline_metadata,
-    deepspeed_matmul,
+    make_baseline_inputs,
     make_portable_inputs,
-    make_quantized_inputs,
     original_deepspeed_skip_reason,
     strict_matmul_context,
     torch_reference,
@@ -114,7 +118,7 @@ class Fp8GemmBenchmark(base.GenericBenchmark):
         if self.candidate_only:
             return
         if base.Config.skip_native:
-            raise ValueError("FP8 GEMM acceptance requires the DeepSpeed baseline")
+            raise ValueError("FP8 GEMM acceptance requires the selected baseline")
         if not _REQUIRED_METRICS.issubset(self.to_bench_metrics):
             raise ValueError(
                 "FP8 GEMM acceptance requires latency_base, latency, and speedup metrics"
@@ -202,7 +206,7 @@ class Fp8GemmBenchmark(base.GenericBenchmark):
         previous = base.Config.native_baseline_skip_reason
         base.Config.native_baseline_skip_reason = (
             "Explicit --metrics latency: candidate-only diagnostic; "
-            "DeepSpeed speedup acceptance NOT evaluated"
+            "Baseline speedup acceptance NOT evaluated"
         )
         try:
             return super()._emit_result(dtype, metrics)
@@ -225,31 +229,43 @@ def fp8_gemm_case_fn(shape, dtype):
             "baseline": (
                 "none-candidate-only"
                 if set(base.Config.user_desired_metrics or ()) == {"latency"}
-                else "deepspeed-original"
+                else (
+                    "torch-dequantize-matmul"
+                    if flag_train.vendor_name == "ascend"
+                    else "deepspeed-original"
+                )
             ),
             "shape_origin": "supplemental" if m in SUPPLEMENTAL_M else "upstream",
             "shape_group": "large-m" if m in LARGE_M else "base",
-            "original_deepspeed_check": "known-check-runtime",
+            "original_deepspeed_check": (
+                "not-applicable"
+                if flag_train.vendor_name == "ascend"
+                else "known-check-runtime"
+            ),
         },
         builder_args=(m, k, n),
     )
 
 
 def fp8_gemm_build_inputs(plan, dtype, device, metadata):
-    """Build a verified original-DeepSpeed comparison outside timing."""
+    """Validate both implementations outside timing; do not cache dequantization."""
     m, k, n = plan.builder_args
     group_size = plan.params["group_size"]
-    x, weight, scale, fpq = make_quantized_inputs(m, k, n, dtype, group_size, device)
-    reference = torch.matmul(x, fpq.dequantize(weight, scale=fpq.scale))
+    x, weight, scale, fpq = make_baseline_inputs(m, k, n, dtype, group_size, device)
+    reference = (
+        torch_reference(x, weight, scale, group_size)
+        if fpq is None
+        else torch.matmul(x, fpq.dequantize(weight, scale=fpq.scale))
+    )
     candidate = matmul_fp8_triton(x, weight, scale, group_size)
-    baseline = deepspeed_matmul(x, weight, scale, group_size, fpq)
+    baseline = baseline_matmul(x, weight, scale, group_size, fpq)
     assert_fp8_close(candidate, reference)
     assert_fp8_close(baseline, reference)
     assert_fp8_close(candidate, baseline, mean_relative=False)
     torch_device_fn.synchronize()
 
     # The framework drops unknown positional object types. Keep the quantizer
-    # in kwargs, and persist the original-baseline identity in recorded inputs.
+    # in kwargs, and persist the selected baseline identity in recorded inputs.
     return (
         x,
         weight,
@@ -260,8 +276,8 @@ def fp8_gemm_build_inputs(plan, dtype, device, metadata):
 
 
 def torch_op(x, weight, scale, group_size, *, fpq, baseline_label):
-    """Unmodified DeepSpeed allocating public API."""
-    return deepspeed_matmul(x, weight, scale, group_size, fpq)
+    """Full allocating baseline; Ascend decodes/scales on every timed call."""
+    return baseline_matmul(x, weight, scale, group_size, fpq)
 
 
 def train_op(x, weight, scale, group_size, *, fpq, baseline_label):
@@ -272,7 +288,7 @@ def train_op(x, weight, scale, group_size, *, fpq, baseline_label):
 @pytest.mark.fp8_gemm
 @pytest.mark.parametrize("m,dtype", _PYTEST_CASES)
 def test_fp8_gemm_perf(m, dtype):
-    """Benchmark exactly one visible original-DeepSpeed core case."""
+    """Benchmark exactly one visible core case against the selected baseline."""
     bench = Fp8GemmBenchmark(
         selected_shape=(m, _K, _N),
         case_fn=fp8_gemm_case_fn,

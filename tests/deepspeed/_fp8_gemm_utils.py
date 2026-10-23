@@ -2,16 +2,18 @@
 # SPDX-License-Identifier: Apache-2.0
 """Shared FP8 GEMM test/benchmark oracles; never imported by production code.
 
-Portable inputs and the torch oracle do not require DeepSpeed. The only
-performance acceptance baseline is the unmodified DeepSpeed public API. Known upstream
-limitations have a source/version/device-scoped skip policy. No kernel, launch
-configuration or input storage is patched. Unexpected failures remain failures.
+Ascend explicitly uses Torch eager dequantization + matmul as the full baseline;
+other vendors retain DeepSpeed's original public API and real quantizer. The
+independent arithmetic oracle and Ascend baseline do not require DeepSpeed.
+Known upstream limitations have a source/version/device-scoped skip policy.
+Unexpected failures remain failures; there is no exception-triggered fallback.
 """
 
 import contextlib
 import functools
 import hashlib
 import importlib
+import math
 import subprocess
 from pathlib import Path
 
@@ -48,13 +50,49 @@ def load_deepspeed():
     except Exception as exc:
         raise RuntimeError(
             "DeepSpeed FP8 GEMM is required for original-baseline acceptance. Install/build "
-            "DeepSpeed with DS_BUILD_FP_QUANTIZER=1; no replacement oracle is "
+            "DeepSpeed (DS_BUILD_FP_QUANTIZER=1 for the CUDA quantizer); no replacement oracle is "
             f"selected automatically. Original error: {exc!r}"
         ) from exc
     return deepspeed, QuantizationConfig, FP_Quantize, matmul_fp8, module
 
 
 def baseline_metadata():
+    common = {
+        "vendor": flag_train.vendor_name,
+        "device": str(flag_train.device),
+        "torch_version": torch.__version__,
+        "triton_version": triton.__version__,
+        "validation_dtype": "torch.bfloat16",
+        "upstream_m": UPSTREAM_M,
+        "supplemental_m": SUPPLEMENTAL_M,
+        "base_m": BASE_M,
+        "large_m": LARGE_M,
+        "comparison_scope": "base-and-large; all shapes attempted on every vendor",
+        "assertion": "BF16 train_assert_close rtol=.016/atol=.025 and upstream relative error <.004",
+    }
+    if flag_train.vendor_name == "ascend":
+        source = Path(__file__).resolve()
+        return {
+            **common,
+            "mode": "torch-dequantize-matmul",
+            "public_api": "torch_composite_matmul: torch_dequantize_custom_e4m3 + torch.matmul",
+            "baseline_source": str(source),
+            "baseline_source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+            "deepspeed_version": None,
+            "deepspeed_commit": None,
+            "deepspeed_source_sha256": None,
+            "execution": "torch eager; no torch.compile or cached decoded weights",
+            "timed_scope": (
+                "uint8-to-int32 indices + format lookup + FP32 scale + BF16 cast "
+                "+ BF16 matmul + allocations"
+            ),
+            "constant_setup": (
+                "fixed 256-entry FP32 format table (1 KiB/device), independent "
+                "of inputs; initialized before timing"
+            ),
+            "scale_storage": "pre-generated contiguous float32 [groups, 1]; no padding",
+            "input_pipeline": "fixed-seed CPU-generated custom E4M3 uint8 weights; quantizer not evaluated",
+        }
     deepspeed, _, _, _, module = load_deepspeed()
     source = Path(module.__file__).resolve()
     try:
@@ -66,25 +104,18 @@ def baseline_metadata():
     except (OSError, subprocess.CalledProcessError):
         commit = None
     return {
+        **common,
         "mode": "original",
-        "vendor": flag_train.vendor_name,
-        "device": str(flag_train.device),
         "deepspeed_version": deepspeed.__version__,
         "deepspeed_commit": commit,
         "deepspeed_source": str(source),
         "deepspeed_source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
-        "triton_version": triton.__version__,
         "public_api": "deepspeed.ops.fp_quantizer.matmul_fp8",
         "kernel_modifications": "none",
         "launch_overrides": "none",
         "scale_storage": "unmodified fpq.get_scales() result; no padding",
-        "validation_dtype": "torch.bfloat16",
-        "upstream_m": UPSTREAM_M,
-        "supplemental_m": SUPPLEMENTAL_M,
-        "base_m": BASE_M,
-        "large_m": LARGE_M,
-        "comparison_scope": "base-and-large; all shapes attempted on every vendor",
-        "assertion": "BF16 train_assert_close rtol=.016/atol=.025 and upstream relative error <.004",
+        "input_pipeline": "original DeepSpeed FP_Quantize.quantize",
+        "timed_scope": "original DeepSpeed allocating FP8 GEMM entry",
     }
 
 
@@ -143,8 +174,15 @@ def original_deepspeed_skip_reason(m, k, n, dtype, group_size, device, metadata=
     return None
 
 
-def make_quantized_inputs(m, k, n, dtype, group_size, device):
-    """Generate actual DeepSpeed-quantized weights outside any timing region."""
+def make_baseline_inputs(m, k, n, dtype, group_size, device):
+    """Build identical operands for both implementations outside timing.
+
+    Ascend uses Torch dequantization + matmul, with encoded inputs independent
+    of the unsupported NPU quantizer. This is a fixed policy, never an
+    exception-triggered fallback. Other vendors keep real DeepSpeed quantization.
+    """
+    if flag_train.vendor_name == "ascend":
+        return (*make_portable_inputs(m, k, n, dtype, group_size, device), None)
     _, QuantizationConfig, FP_Quantize, _, _ = load_deepspeed()
     generator = torch.Generator(device=device).manual_seed(20260922)
     raw = torch.randn(k, n, device=device, dtype=torch.bfloat16, generator=generator)
@@ -163,7 +201,8 @@ def make_portable_inputs(m, k, n, dtype, group_size, device):
     """Fixed CPU-generated encoded inputs; no vendor RNG or quantizer dependency.
 
     These are valid custom E4M3 bytes, not a replacement for DeepSpeed's
-    quantizer. Original-baseline acceptance continues to use its real quantizer.
+    quantizer. The Ascend Torch-baseline comparison uses these operands; other
+    vendors' original-public-API acceptance continues to use the real quantizer.
     """
     generator = torch.Generator(device="cpu").manual_seed(20260922)
     x = torch.randn(m, k, generator=generator).to(dtype)
@@ -175,9 +214,60 @@ def make_portable_inputs(m, k, n, dtype, group_size, device):
     return x.to(device), weight.to(device), scale.to(device)
 
 
-def deepspeed_matmul(x, weight, scale, group_size, fpq):
-    """Call the original public baseline API without any kernel substitution."""
+def baseline_matmul(x, weight, scale, group_size, fpq):
+    """Run the explicit vendor baseline; propagate errors without substitution."""
+    if flag_train.vendor_name == "ascend":
+        return torch_composite_matmul(x, weight, scale, group_size)
     return load_deepspeed()[3](x, weight, scale, group_size, fpq)
+
+
+@functools.lru_cache(maxsize=16)
+def _custom_e4m3_codebook(device):
+    """Immutable format constants only; never cache input weights or indices."""
+    return torch.tensor(
+        [
+            math.ldexp(
+                (-1.0 if code & 128 else 1.0) * (8 + (code & 7)),
+                ((code >> 3) & 15) - 10,
+            )
+            for code in range(256)
+        ],
+        dtype=torch.float32,
+        device=device,
+    )
+
+
+def torch_dequantize_custom_e4m3(weight, scale, group_size, dtype):
+    """Vectorized Torch eager format lookup, separate from the arithmetic oracle.
+
+    All 256 codes are finite, including exponent zero/15. Cache only the fixed
+    1 KiB format table, not decoded/scaled weights, input-derived indices or
+    outputs. Each call reads every input byte and performs lookup and scaling.
+    Full groups use broadcast scaling, with a separate final partial group.
+    No per-call host transfers, scalar reads, compilation or Python row loop.
+    """
+    indices = weight.reshape(-1).to(torch.int32)
+    values = torch.index_select(_custom_e4m3_codebook(weight.device), 0, indices)
+    scales = scale.reshape(-1)
+    full, tail = divmod(weight.numel(), group_size)
+    if not tail:
+        scaled = values.reshape(full, group_size) * scales.reshape(-1, 1)
+    else:
+        prefix = values[: full * group_size].reshape(full, group_size)
+        prefix = (prefix * scales[:full].reshape(-1, 1)).reshape(-1)
+        suffix = values[full * group_size :] * scales[full]
+        scaled = torch.cat((prefix, suffix))
+    return scaled.reshape(weight.shape).to(dtype)
+
+
+def torch_composite_matmul(x, weight, scale, group_size):
+    """Timed baseline: decode/scale/round afresh, then native-dtype matmul.
+
+    This deliberately does not call torch_reference: that independent oracle
+    uses chunked arithmetic and FP32 matmul (and optionally CPU transfers).
+    """
+    decoded = torch_dequantize_custom_e4m3(weight, scale, group_size, x.dtype)
+    return torch.matmul(x, decoded)
 
 
 def decode_custom_e4m3(weight, scale, group_size, dtype):
@@ -193,9 +283,14 @@ def decode_custom_e4m3(weight, scale, group_size, dtype):
     for start in range(0, k, 128):
         codes = weight[start : start + 128].to(torch.int32)
         sign = 1.0 - 2.0 * ((codes >> 7) & 1).to(torch.float32)
-        exponent = ((codes >> 3) & 15).to(torch.float32)
-        mantissa = (codes & 7).to(torch.float32)
-        unscaled = sign * (1.0 + mantissa / 8.0) * torch.exp2(exponent - 7.0)
+        exponent = (codes >> 3) & 15
+        mantissa = codes & 7
+        # (1 + mantissa/8) * 2**(exponent-7), evaluated exactly.
+        # Device exp2 can approximate even integer powers of two. The largest
+        # shifted integer is 15 << 15, exactly representable in int32/FP32.
+        # This remains an arithmetic oracle, independent of kernel bitcasts.
+        magnitude = ((8 + mantissa) << exponent).to(torch.float32) * (1.0 / 1024)
+        unscaled = sign * magnitude
         groups = (
             torch.arange(
                 start * n,
