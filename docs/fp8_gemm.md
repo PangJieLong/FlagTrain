@@ -8,13 +8,16 @@ An Ascend override in
 `src/flag_train/runtime/backend/_ascend/ops/deepspeed/fp8_gemm_triton.py` uses
 separate Triton decode and GEMM kernels for selected large-M BF16 inputs and
 delegates other supported inputs to the unchanged generic implementation.
+A T-Head override in
+`src/flag_train/runtime/backend/_thead/ops/deepspeed/fp8_gemm_triton.py` reuses
+the same generic fused kernel with a larger K tile for aligned medium-M BF16.
 Output has the activation dtype. The API is forward-only. Weights are not
 `torch.float8_e4m3fn`: byte zero represents `2**-7` before scaling; groups index
 flattened `[K, N]` elements. Production code imports no DeepSpeed helpers.
 
 ## Current acceptance scope
 
-The generic implementation, Ascend override and shared BF16 tests use FlagTrain's
+The generic implementation, Ascend/T-Head overrides and shared BF16 tests use FlagTrain's
 active device and public component API, following the LAMB and
 `GenericBenchmark` structure.
 There is no NVIDIA-only entry guard or vendor-wide test skip. Historical NVIDIA
@@ -26,9 +29,11 @@ baseline on 910B4 with CANN 9.0.0; see the dated acceptance results below.
 The latest shared-test revision and Ascend registration changes have not been
 rerun on NVIDIA hardware. The generic production kernel is unchanged, but the
 dated NVIDIA results below are historical, not physical regression results for
-this revision. Hygon (`hygon`), T-Head (`thead`), MetaX (`metax`) and other backends
-are **pending hardware validation**, not claimed supported or fast merely by
-collecting tests.
+this revision. T-Head (`thead`) passed the dated original-DeepSpeed validation
+below after adding a launch-policy override. Hygon (`hygon`), MetaX (`metax`)
+and other backends are **pending hardware validation**, not claimed supported
+or fast merely by collecting tests. The additional medium-M boundary tests
+have not been physically rerun on NVIDIA or Ascend.
 Existing FP16 entry points, gradients and end-to-end training are not covered.
 
 On NVIDIA and other non-Ascend vendors the baseline remains the **unmodified**
@@ -88,7 +93,26 @@ Vendor implementations can follow the existing Hygon component layout under
 `SpecOpRegistrar` in `flag_train.deepspeed` replaces the generic export when an
 override exists; both test suites call that public export. The Ascend package's
 `__init__.py` registers its FP8 GEMM override through this mechanism. No overrides
-or hardware-validation claims are added for other vendors.
+are added for other vendors beyond the T-Head launch policy documented below.
+
+## T-Head launch policy
+
+The T-Head public override calls the generic `_validate` and `_launch`; it does
+not duplicate the Triton kernel. For BF16, `16 < M <= 64`, group size 128 and
+positive K/N both divisible by 128, it selects BM=32 for M<=32 or BM=64 otherwise,
+BN=64, BK=128, four warps and three stages. Other inputs retain the generic
+launch policy. It preserves the fused decode/scale/GEMM operation, activation
+strides and masked M tails, with no extra workspace or cross-call cache.
+
+Compared with the generic BK=64 policy in this range, BK=128 halves the K-loop
+count. On the measured PPU stack this reduced latency enough to meet the fixed
+0.8x floor. A bounded configuration experiment compared 15 tile/warp/stage
+choices on M=32 and M=64, checking accuracy before timing each configuration.
+No DeepSpeed launch parameters or benchmark inputs were changed. The final
+policy is deterministic and does not tune against the baseline at runtime.
+Ten shared edge cases cover M=16/17/32/33/64/65, noncontiguous medium-M
+activations, unaligned K/N and another group size. These are correctness checks,
+not additional acceptance performance shapes; all 15 core shapes remain fixed.
 
 ## Ascend implementation and memory trade-off
 
@@ -202,7 +226,7 @@ Repository `train_assert_close` ultimately uses `torch.testing.assert_close`:
 BF16 rtol=0.016 and fixed atol=0.025. Core checks retain upstream's native-dtype
 mean-relative-error formula and threshold `<0.004`, plus an FP32 relative mean
 as an additional stable assertion. Neither check replaces a failed assertion.
-There are also 30 candidate-only edge/oracle/invalid-input checks; these do not
+There are also 40 candidate-only edge/oracle/invalid-input checks; these do not
 claim that the original wrapper supports the extended input contracts.
 Five of these cover the new large-M dispatch boundary at M=511/512/513, a partial
 N tile, noncontiguous large-M activations and a large-M layout delegated to the
@@ -314,6 +338,77 @@ Triton 3.6.0 and DeepSpeed 0.17.7+79caae1 on H20-3e. Two pre-existing external
 DeepSpeed build adaptations permit Triton 3.6 and rename a CUDA translation unit
 to avoid duplicate object names. They do not modify the GEMM kernel or launch
 and are not part of this FlagTrain contribution.
+
+## T-Head original-DeepSpeed acceptance (2026-10-24)
+
+Environment: PPU-ZW810E, PPU driver 1.3.2-d7f5a2, HGGC 13.0, Python 3.12.3,
+Torch 2.9.0, Triton distribution `3.5.0+ppu2.0.0.oe` (module version 3.5.0)
+and pytest 7.2.0. Final validation used physical device 1 with
+`CUDA_VISIBLE_DEVICES=1`; FlagTrain identified `vendor_name=thead`, `device=cuda`.
+The public API resolved to the T-Head override. Original DeepSpeed's accelerator
+reported Triton support, so its public API used its original Triton entry rather
+than the Torch fallback.
+
+The system DeepSpeed 0.14.4 lacks `matmul_fp8`. A separate source checkout at
+commit `79caae1c04fca210345bdeb03bcacf87b1ac2f23` supplies the same baseline as
+the historical NVIDIA validation. The **only external build adaptation** adds
+`"3.5"` to `FPQuantizerBuilder.is_compatible`'s `allowed_versions` tuple in
+`op_builder/fp_quantizer.py`. Its original quantizer then compiled through the
+platform compiler and was used to prepare the actual inputs. Quantization
+sources, public API, GEMM kernel and launch settings are unchanged. This build
+adaptation is outside FlagTrain and is not part of its contribution. Source-only
+loading reports `deepspeed.__version__ == "0.0.0"`; identify this baseline by
+the exact commit above and the unchanged GEMM source SHA256
+`5c376c95cca24995283a13ca2a6ec7773cbad20aaa90e74e0ea7a18fe8826096`, not that
+fallback version string. The system installation was not replaced.
+
+Before specialization, the generic implementation passed 85 device-reference
+and 85 CPU-reference checks. Its full original-baseline benchmark produced
+11 passes and four performance failures: M=17/32/48/64 measured
+0.688518x/0.689782x/0.683446x/0.675206x. These failures were retained and fixed,
+not skipped or removed.
+
+After the launch-policy override and ten additional boundary checks:
+
+- Full device-reference correctness: **95 passed, 0 skipped**.
+- Full CPU-reference correctness: **95 passed, 0 skipped**.
+- With all DeepSpeed imports blocked: **80 portable checks passed**, with the
+  15 baseline-comparison nodes explicitly deselected (not baseline acceptance).
+- Two complete original-baseline benchmarks: **15 passed, 0 skipped** each;
+  ratios **0.938278x–3.540727x** and **0.939677x–3.525103x**.
+- Black 26.5.1, isort 5.12.0, repository-configured flake8 and diff checks passed.
+
+The baseline is `deepspeed.ops.fp_quantizer.matmul_fp8`, with actual DeepSpeed
+quantization and decoder cross-checks. Timing uses the shared kernel-mode
+`triton.testing.do_bench` path; both public calls include output allocation.
+Quantization and reference checks remain outside timing. All 15 core shapes,
+including the four large-M shapes skipped on the pinned NVIDIA H20 stack, ran
+without skips on this PPU stack. Ratios below 1 mean slower than DeepSpeed but
+still satisfy the requested >0.8x floor. These are BF16 forward-operator results,
+not FP16, backward, end-to-end training or other-device guarantees.
+
+The generic kernel, NVIDIA/Ascend implementations, selected-baseline policy and
+accuracy tolerances were not modified. Tests still use the same shared files.
+This latest shared-test revision has not been physically rerun on NVIDIA or
+Ascend. No cross-platform regression or CI pass is implied by the PPU results.
+
+In the development environment, using the separate build-adapted DeepSpeed
+checkout and JIT cache:
+
+```bash
+source /root/pangjielong/venv/bin/activate
+cd /root/pangjielong/FlagTrain
+export CUDA_VISIBLE_DEVICES=1 OMP_NUM_THREADS=8 MAX_JOBS=4
+export PYTHONPATH="/root/pangjielong/DeepSpeed-fp8-0.17.7:$PWD/src:$PWD"
+export TORCH_EXTENSIONS_DIR=/root/pangjielong/fp8_results_20261024/torch_extensions
+python -m pytest tests/deepspeed/test_fp8_gemm.py -q -ra
+python -m pytest tests/deepspeed/test_fp8_gemm.py -q -ra --ref cpu
+python -m pytest benchmark/deepspeed/test_fp8_gemm.py -q -s -ra --mode=kernel
+```
+
+Final JSON/logs are retained outside the repository at
+`/root/pangjielong/fp8_results_20261024/final_checked/`; the initial failures,
+configuration experiment and quantizer build log remain in its parent directory.
 
 ## Ascend Torch-composite acceptance (2026-10-23)
 
