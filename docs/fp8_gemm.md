@@ -7,17 +7,20 @@ DeepSpeed custom uint8 E4M3 decoding, scaling and GEMM with FP32 accumulation.
 An Ascend override in
 `src/flag_train/runtime/backend/_ascend/ops/deepspeed/fp8_gemm_triton.py` uses
 separate Triton decode and GEMM kernels for selected large-M BF16 inputs and
-delegates other supported inputs to the unchanged generic implementation.
+delegates other supported inputs to the generic implementation's default policy.
 A T-Head override in
 `src/flag_train/runtime/backend/_thead/ops/deepspeed/fp8_gemm_triton.py` reuses
 the same generic fused kernel with a larger K tile for aligned medium-M BF16.
+A MetaX override in
+`src/flag_train/runtime/backend/_metax/ops/deepspeed/fp8_gemm_triton.py` uses
+a fused small-M path and separate decode/GEMM kernels for eligible larger BF16 inputs.
 Output has the activation dtype. The API is forward-only. Weights are not
 `torch.float8_e4m3fn`: byte zero represents `2**-7` before scaling; groups index
 flattened `[K, N]` elements. Production code imports no DeepSpeed helpers.
 
 ## Current acceptance scope
 
-The generic implementation, Ascend/T-Head overrides and shared BF16 tests use FlagTrain's
+The generic implementation, vendor overrides and shared BF16 tests use FlagTrain's
 active device and public component API, following the LAMB and
 `GenericBenchmark` structure.
 There is no NVIDIA-only entry guard or vendor-wide test skip. Historical NVIDIA
@@ -27,18 +30,18 @@ fixed Torch lookup-table composite baseline. The Ascend two-stage path passed
 full BF16 correctness and two complete performance runs against that same
 baseline on 910B4 with CANN 9.0.0; see the dated acceptance results below.
 The latest shared-test revision and Ascend registration changes have not been
-rerun on NVIDIA hardware. The generic production kernel is unchanged, but the
+rerun on NVIDIA hardware. The generic default scale-broadcast policy is retained, but the
 dated NVIDIA results below are historical, not physical regression results for
 this revision. T-Head (`thead`) passed the dated original-DeepSpeed validation
-below after adding a launch-policy override. Hygon (`hygon`), MetaX (`metax`)
-and other backends are **pending hardware validation**, not claimed supported
+below after adding a launch-policy override. MetaX (`metax`) results are recorded
+separately below. Hygon (`hygon`) and other backends are **pending hardware validation**, not claimed supported
 or fast merely by collecting tests. The additional medium-M boundary tests
 have not been physically rerun on NVIDIA or Ascend.
 Existing FP16 entry points, gradients and end-to-end training are not covered.
 
-On NVIDIA and other non-Ascend vendors the baseline remains the **unmodified**
+On NVIDIA, T-Head and other vendors except Ascend/MetaX, the baseline remains the **unmodified**
 public API `deepspeed.ops.fp_quantizer.matmul_fp8`, with real DeepSpeed quantization.
-On Ascend the explicitly selected functional and performance baseline is
+On Ascend and MetaX the explicitly selected functional and performance baseline is
 **Torch eager dequantization followed by BF16 `torch.matmul`**. The decoder uses
 a fixed 256-entry FP32 custom E4M3 codebook (1 KiB per device) and
 `torch.index_select`. Every timed call converts all input bytes to int32 indices,
@@ -49,14 +52,16 @@ Input-derived indices, decoded/scaled weights and outputs are never cached.
 Neither `torch.compile` nor the independent correctness oracle is used as this
 baseline.
 Both calls receive identical fixed-seed, pre-generated custom E4M3 weights and
-scales. This tests the decode-and-GEMM workload, not DeepSpeed's unsupported NPU
-quantizer, original Triton entry or high-level fallback.
+scales. This tests the decode-and-GEMM workload, not DeepSpeed's quantizer,
+original Triton entry or high-level fallback. The explicit MetaX policy was
+approved after both original build checks and standalone original Triton entry
+probes failed on the measured stack; it is not an automatic error fallback.
 
 The vendor policy is fixed, not selected by catching an execution failure.
 Reports identify the baseline mode, input pipeline, timed scope and source hash
-(the Torch helper on Ascend, the upstream GEMM source elsewhere). No DeepSpeed
-kernel or launch settings are modified. Ascend tests and benchmarks do not
-require DeepSpeed. Missing DeepSpeed dependencies on non-Ascend original-baseline
+(the Torch helper on Ascend/MetaX, the upstream GEMM source elsewhere). No DeepSpeed
+kernel or launch settings are modified. Ascend/MetaX tests and benchmarks do not
+require DeepSpeed. Missing DeepSpeed dependencies on original-baseline
 paths remain errors, not a reason to silently substitute Torch. Portable
 candidate correctness tests also do not import or require DeepSpeed.
 
@@ -69,8 +74,8 @@ candidate correctness tests also do not import or require DeepSpeed.
    `python -m pytest tests/deepspeed/test_fp8_gemm.py -q -ra -k "not against_baseline"`.
    Add `--ref cpu` to execute decoding and reference matmul on CPU, not simply
    copy a reference result computed on the accelerator.
-3. On non-Ascend paths, install original DeepSpeed and build its FP quantizer.
-   Ascend's selected Torch baseline requires no DeepSpeed installation. Run the
+3. Except on Ascend/MetaX, install original DeepSpeed and build its FP quantizer.
+   Ascend/MetaX Torch baselines require no DeepSpeed installation. Run the
    full correctness and default performance commands below. Baseline build,
    execution and numerical failures remain visible failures. Only the narrowly
    identified NVIDIA H20 limitation below is skipped.
@@ -92,8 +97,39 @@ Vendor implementations can follow the existing Hygon component layout under
 `__all__`; the runtime discovers the backend ops package and its subpackages.
 `SpecOpRegistrar` in `flag_train.deepspeed` replaces the generic export when an
 override exists; both test suites call that public export. The Ascend package's
-`__init__.py` registers its FP8 GEMM override through this mechanism. No overrides
-are added for other vendors beyond the T-Head launch policy documented below.
+`__init__.py` registers its FP8 GEMM override through this mechanism, as do the
+T-Head and MetaX packages described below.
+
+## MetaX implementation and memory trade-off
+
+The MetaX entry reuses generic `_validate`. For BF16, `M > 16`, group size 128
+and positive K/N divisible by 128, it selects separate Triton decode and GEMM
+kernels. Weight elements, output elements and maximum activation element offset
+must each fit signed int32; otherwise it uses the fused path. These guards do
+not imply that oversized tensors fit hardware memory or have been validated.
+The decoder handles 32 groups (4096 weights) per program. The GEMM uses FP32
+accumulation, activation strides and masked tails, with four warps and one stage:
+
+| M | BM | BN | BK |
+| --- | ---: | ---: | ---: |
+| 17–128 | 64 | 64 | 64 |
+| 129–512 | 64 | 128 | 32 |
+| >512 | 128 | 128 | 32 |
+
+Each public call allocates and repopulates a `2*K*N`-byte BF16 workspace
+(64 MiB for the core shapes), plus a new output. Both kernels execute inside
+the timed call; weights, scales, decoded workspaces and outputs are not cached.
+Production computation uses Triton, not the Torch baseline. This trades extra
+device-memory traffic for avoiding repeated decoding across M tiles.
+
+Other inputs use generic `_launch` with a MetaX-specific fused configuration:
+BM=16/32/64/128 according to M, BN=128, BK=64, four warps and one stage.
+Only this path passes `broadcast_scales=False`, loading each element's scale
+with the same group indexing instead of rank-one broadcasting. This avoids a
+reproduced MetaX MMA shared-layout compiler failure. The generic keyword
+defaults to True, preserving other vendors' default scale-loading policy.
+The smaller tile/stage configuration also avoids observed shared-memory limits.
+Compilation failures are not caught and retried with another implementation.
 
 ## T-Head launch policy
 
@@ -173,7 +209,7 @@ All core shapes use `K=4096`, `N=8192`, `quantization_group_size=128`:
 Both groups run by default. A `shape_group` label distinguishes them in benchmark
 case plans, timing-row provenance and pytest/JUnit properties (the shared accuracy
 JSON does not serialize these properties); it does not disable large shapes. All 15
-candidate shapes run against the torch reference. Ascend attempts all 15 Torch
+candidate shapes run against the torch reference. Ascend and MetaX attempt all 15 Torch
 baseline comparisons, including all four large-M cases. H20/Triton 3.6 baseline
 resource skips below are **not** copied to Ascend, Hygon, T-Head or MetaX.
 Passing the base group does not establish large-M performance acceptance.
@@ -202,16 +238,16 @@ Every candidate core shape uses deterministic CPU-generated custom E4M3 bytes,
 scales and activations, transferred to the active backend. The independent
 arithmetic decoder uses FP32 (no accelerator FP64 requirement) and checks the
 candidate against torch matmul. These bytes are test inputs, not an alternative
-DeepSpeed quantizer. Ascend's Torch-composite acceptance also uses these encoded
+DeepSpeed quantizer. Ascend/MetaX Torch-composite acceptance also uses these encoded
 inputs; both implementations consume the same activation, bytes and scales.
 
-On non-Ascend vendors, separate original-baseline tests use actual DeepSpeed
+On original-baseline vendors, separate tests use actual DeepSpeed
 quantization and upstream's reference
 `torch.matmul(x, fpq.dequantize(weight, scale=fpq.scale))`. The independent
 decoder must also exactly match DeepSpeed's decoder; both implementations are
 checked against the reference and compared directly with each other. Under
 `--ref cpu`, reference operands are moved before the decoder and matmul execute.
-On Ascend, the Torch composite baseline and candidate GEMM instead compare
+On Ascend/MetaX, the Torch composite baseline and candidate GEMM instead compare
 against the independent arithmetic decoder and FP32 torch matmul, rounded back
 to BF16, using their shared pre-generated operands. The baseline performs
 vectorized `torch.index_select` from the fixed 256-entry FP32 format codebook,
@@ -226,7 +262,7 @@ Repository `train_assert_close` ultimately uses `torch.testing.assert_close`:
 BF16 rtol=0.016 and fixed atol=0.025. Core checks retain upstream's native-dtype
 mean-relative-error formula and threshold `<0.004`, plus an FP32 relative mean
 as an additional stable assertion. Neither check replaces a failed assertion.
-There are also 40 candidate-only edge/oracle/invalid-input checks; these do not
+There are also candidate-only edge/oracle/invalid-input checks; these do not
 claim that the original wrapper supports the extended input contracts.
 Five of these cover the new large-M dispatch boundary at M=511/512/513, a partial
 N tile, noncontiguous large-M activations and a large-M layout delegated to the
@@ -237,12 +273,12 @@ The functional suite additionally checks that four non-NVIDIA vendor identities
 cannot inherit the H20 skip and that a portable candidate case never loads
 DeepSpeed. Vendor-identity policy tests are not hardware execution tests.
 Entry-routing policy cases and failure-propagation checks additionally verify
-that only Ascend uses the Torch composite path and that neither selected
+that only Ascend/MetaX use the Torch composite path and that neither selected
 baseline is replaced after an error. Decoder checks cover all 256 codes, zero
 and non-power-of-two scales, partial groups and BF16/FP32 outputs. Further checks
 verify that every baseline invocation decodes again, that real mutations of
 weights and scales affect the next result rather than reusing cached data, and
-that Ascend input construction, metadata and baseline execution do not load
+that Ascend/MetaX input construction, metadata and baseline execution do not load
 DeepSpeed. The full suite contains 15 core baseline-comparison nodes in addition
 to portable core, edge, contract and policy tests; report the collected count
 from the actual run.
@@ -254,17 +290,17 @@ Each core shape is a separate pytest node. NVIDIA kernel mode uses
 repetitions and median statistic. Both timed calls allocate their output and
 consume identical inputs. Encoded-input preparation, quantization where used,
 independent reference construction and correctness checks occur outside timing.
-On Ascend, input-byte conversion to int32 indices, all weight lookups, FP32
+On Ascend/MetaX, input-byte conversion to int32 indices, all weight lookups, FP32
 scaling, BF16 conversion, BF16 matmul and their allocations remain inside each
 measured baseline invocation. Initialization of the input-independent 1 KiB
 format codebook is the only decoder setup outside timing; no tensor derived
 from the current weights, scales or shape is retained between calls. The
 benchmark must not time only matmul on predecoded weights. Every measured case
 must satisfy `selected_baseline_latency / FlagTrain_latency > 0.8`; a lower
-result fails, not skips. Ascend ratios are against this Torch composite, not
+result fails, not skips. Ascend/MetaX ratios are against this Torch composite, not
 DeepSpeed, and must not be presented as original-DeepSpeed speedups.
 The candidate is also timed through its complete allocating public API. For
-eligible Ascend large-M inputs this includes allocation and population of the
+eligible Ascend and MetaX two-stage inputs this includes allocation and population of the
 BF16 workspace, the decode launch, the GEMM launch and output allocation inside
 the call. Kernel-mode results count the device execution of both stages; they
 do not separately quantify Python dispatch or host allocation overhead.
@@ -338,6 +374,76 @@ Triton 3.6.0 and DeepSpeed 0.17.7+79caae1 on H20-3e. Two pre-existing external
 DeepSpeed build adaptations permit Triton 3.6 and rename a CUDA translation unit
 to avoid duplicate object names. They do not modify the GEMM kernel or launch
 and are not part of this FlagTrain contribution.
+
+## MetaX Torch-composite acceptance (2026-10-26/27)
+
+Environment: MetaX C550, physical device 1, Python 3.12.11,
+Torch `2.8.0+metax3.7.2.0`, private FlagTree `0.7.0.post2+metax3.6` environment,
+and actual imported Triton module **3.6.0**. System distribution metadata still
+lists an older Triton; it is not the module used for these runs. FlagTrain
+identifies `vendor_name=metax`, `device=cuda`; the public API uses the MetaX override.
+
+- Final full device-reference correctness: **104 passed, 0 skipped**.
+- Final full CPU-reference correctness: **104 passed, 0 skipped**.
+- With all DeepSpeed imports blocked: **104 passed, 0 skipped**.
+- Two complete performance runs: **15 passed, 0 skipped** each, with ratios
+  **1.030244x–5.775472x** and **1.029745x–5.765370x**.
+- M=2048 was the minimum in both runs: baseline 1.630720 ms versus candidate
+  1.582848 ms / 1.583616 ms. Every measured ratio exceeded the fixed 0.8x floor.
+- A supplementary no-DeepSpeed M=2048 benchmark passed at **1.035506x**;
+  14 cases were explicitly deselected. This is not a third full benchmark.
+- Fourteen external metadata-only dispatch/bounds checks passed, without
+  allocating huge tensors; all 16 component export checks passed.
+- Black 26.5.1, isort 5.12.0, repository-configured flake8 (six changed Python
+  files) and `git diff --check` passed.
+
+The final 104 checks include two input-mutation regressions for fused M=1 and
+two-stage M=17, in addition to scale-group/tile-boundary checks. The two full
+benchmark runs used the same production and baseline code before those final
+two correctness-only regressions were added. All 15 fixed BF16 performance
+shapes ran; neither thresholds nor shape exclusions were relaxed.
+
+These ratios compare **Torch eager custom-FP8 dequantization + BF16 matmul**
+against FlagTrain, not original DeepSpeed. Timing uses the shared
+`triton.testing.do_bench` kernel-mode path on each complete public call.
+Allocation remains inside each function, and both candidate stages are timed;
+this is not a host end-to-end or training benchmark.
+
+Original DeepSpeed at commit `79caae1c04fca210345bdeb03bcacf87b1ac2f23`
+could not load its public quantizer API because the stack provides `cucc`, not
+the expected `nvcc`; its version gate also excludes Triton 3.6. Standalone
+diagnostic calls to its original Triton kernel at M=1 and M=256 failed compiler
+PassManager checks, including with the investigated constancy-layout option
+disabled. These probes used pre-generated weights and are not original public
+API acceptance. No DeepSpeed code or launch parameters were modified.
+The user explicitly approved the Torch composite policy after these failures.
+
+Generic-kernel reuse initially produced 31 failures (28 compiler-layout failures
+and three shared-memory failures) in portable checks. After the fused fix, the
+first full Torch-baseline benchmark still failed 10 of 15 cases. These failures
+were retained and addressed by the two-stage policy, not skipped. A bounded
+64-configuration accuracy/timing experiment informed the final fixed tiles.
+Original failures, diagnostics and final evidence are retained outside the repo
+at `/data/pangjielong/fp8_results_20261026/`; final logs/JSON are in `final_checked/`.
+The baseline helper SHA256 for both complete performance runs is
+`00b6a11b0191888e44b16971cc3de0f38e2560e4be44f15cdacf2206d0ce86c8`.
+
+Reproduce in the measured container:
+
+```bash
+source /data/pangjielong/fp8_venv_metax/bin/activate
+cd /data/pangjielong/FlagTrain
+export CUDA_VISIBLE_DEVICES=1 MACA_VISIBLE_DEVICES=1 OMP_NUM_THREADS=8
+export PYTHONPATH="$PWD/src:$PWD"
+python -m pytest tests/deepspeed/test_fp8_gemm.py -q -ra --record=json --output=/tmp/fp8_metax_accuracy.json
+python -m pytest tests/deepspeed/test_fp8_gemm.py -q -ra --ref cpu --record=json --output=/tmp/fp8_metax_cpu.json
+python -m pytest benchmark/deepspeed/test_fp8_gemm.py -q -s -ra --mode=kernel --record=json --output=/tmp/fp8_metax_benchmark.json
+```
+
+This update has not been physically rerun on NVIDIA, Ascend or T-Head. Existing
+dated results below are historical, not regression evidence for this revision.
+FP16, backward, full training, other operators and huge-tensor execution have
+not been validated by the MetaX acceptance suite.
 
 ## T-Head original-DeepSpeed acceptance (2026-10-24)
 

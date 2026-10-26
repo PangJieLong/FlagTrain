@@ -13,7 +13,7 @@
 # limitations under the License.
 """FP8 GEMM performance against the explicitly selected platform baseline.
 
-Ascend uses Torch eager dequantization + BF16 matmul, including the complete
+Ascend and MetaX use Torch dequantization + BF16 matmul, including the complete
 dequantization in each timed invocation. Other vendors retain original
 DeepSpeed matmul_fp8 with its real quantizer. There is no automatic fallback.
 
@@ -231,7 +231,7 @@ def fp8_gemm_case_fn(shape, dtype):
                 if set(base.Config.user_desired_metrics or ()) == {"latency"}
                 else (
                     "torch-dequantize-matmul"
-                    if flag_train.vendor_name == "ascend"
+                    if flag_train.vendor_name in ("ascend", "metax")
                     else "deepspeed-original"
                 )
             ),
@@ -239,7 +239,7 @@ def fp8_gemm_case_fn(shape, dtype):
             "shape_group": "large-m" if m in LARGE_M else "base",
             "original_deepspeed_check": (
                 "not-applicable"
-                if flag_train.vendor_name == "ascend"
+                if flag_train.vendor_name in ("ascend", "metax")
                 else "known-check-runtime"
             ),
         },
@@ -276,7 +276,7 @@ def fp8_gemm_build_inputs(plan, dtype, device, metadata):
 
 
 def torch_op(x, weight, scale, group_size, *, fpq, baseline_label):
-    """Full allocating baseline; Ascend decodes/scales on every timed call."""
+    """Full allocating baseline; Torch paths decode/scale on every timed call."""
     return baseline_matmul(x, weight, scale, group_size, fpq)
 
 

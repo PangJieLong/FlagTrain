@@ -50,6 +50,7 @@ def _matmul_kernel(
     BN: tl.constexpr,
     BK: tl.constexpr,
     GM: tl.constexpr,
+    BROADCAST_SCALES: tl.constexpr,
 ):
     pid = tle.program_id(0)
     nm = tl.cdiv(M, BM)
@@ -77,7 +78,9 @@ def _matmul_kernel(
             other=0,
         ).to(tl.uint16)
         # Fast broadcast applies only when each tile lies inside one group.
-        if N % GROUP == 0 and GROUP % BN == 0:
+        # Backends may select full indexing when their MMA lowering cannot
+        # compile this rank-one scale broadcast; other vendors retain it.
+        if BROADCAST_SCALES and N % GROUP == 0 and GROUP % BN == 0:
             scales = tl.load(
                 S + kk[:, None] * (N // GROUP) + pn * BN // GROUP,
                 kk[:, None] < K,
@@ -140,7 +143,7 @@ def _validate(inp, weight, scale, group_size):
         raise ValueError(f"expected {expected} scales, got {scale.numel()}")
 
 
-def _launch(inp, weight, scale, group_size, config=None):
+def _launch(inp, weight, scale, group_size, config=None, *, broadcast_scales=True):
     m, k = inp.shape
     n = weight.shape[1]
     out = torch.empty((m, n), dtype=inp.dtype, device=inp.device)
@@ -171,6 +174,7 @@ def _launch(inp, weight, scale, group_size, config=None):
             bn,
             bk,
             8,
+            broadcast_scales,
             num_warps=warps,
             num_stages=stages,
         )
