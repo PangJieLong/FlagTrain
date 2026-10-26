@@ -4,16 +4,25 @@ from flag_train.runtime import device as runtime_device
 from flag_train.runtime.backend import SpecOpRegistrar
 
 from .blocked_flash import blocked_flash
+from .evoformer_attn import evoformer_attn
 from .fp8_gemm_triton import matmul_fp8_triton
 from .lamb import lamb
+from .lion import multi_tensor_lion
+from .mixed_moe_gemm import mixed_moe_gemm
 from .packbits import packbits
+from .unpackbits import unpackbits
+from .wf6af16_linear import wf6af16_linear
 
 __all__ = [
     "blocked_flash",
+    "evoformer_attn",
     "lamb",
     "matmul_fp8_triton",
+    "mixed_moe_gemm",
+    "multi_tensor_lion",
     "packbits",
+    "unpackbits",
+    "wf6af16_linear",
 ]
-
 
 SpecOpRegistrar(registry=globals(), vendor=runtime_device.vendor_name).apply()
