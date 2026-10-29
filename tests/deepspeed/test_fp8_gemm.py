@@ -4,7 +4,7 @@
 
 The mathematical torch oracle is independent of the production bitcast decoder.
 Every core candidate case runs against that oracle. The separate baseline is
-Torch dequantization + matmul on Ascend/MetaX, and the original DeepSpeed API on
+Torch dequantization + matmul on Ascend/MetaX/Hygon, and the original DeepSpeed API on
 other vendors. Only pinned, known-broken NVIDIA baseline cases are skipped;
 candidate/oracle checks are never skipped for baseline limitations.
 
@@ -48,7 +48,7 @@ DTYPES = (torch.bfloat16,)
 
 @pytest.mark.parametrize("vendor", ("ascend", "nvidia", "hygon", "thead", "metax"))
 def test_fp8_baseline_entry_policy(monkeypatch, vendor):
-    """Ascend/MetaX select Torch; other public API signatures stay intact."""
+    """Explicit Torch vendors and original public API signatures stay intact."""
     from . import _fp8_gemm_utils as helpers
 
     calls = []
@@ -66,6 +66,7 @@ def test_fp8_baseline_entry_policy(monkeypatch, vendor):
         assert vendor not in (
             "ascend",
             "metax",
+            "hygon",
         ), "Torch paths must not import DeepSpeed"
         return None, None, None, public, None
 
@@ -76,13 +77,13 @@ def test_fp8_baseline_entry_policy(monkeypatch, vendor):
     assert helpers.baseline_matmul(*operands) is result
     expected = (
         ("torch", operands[:4])
-        if vendor in ("ascend", "metax")
+        if vendor in ("ascend", "metax", "hygon")
         else ("public", operands)
     )
     assert calls == [expected]
 
 
-@pytest.mark.parametrize("vendor", ("ascend", "metax", "nvidia"))
+@pytest.mark.parametrize("vendor", ("ascend", "metax", "hygon", "nvidia"))
 def test_fp8_baseline_failure_is_not_replaced(monkeypatch, vendor):
     """Both selected baselines propagate errors, without an implicit fallback."""
     from . import _fp8_gemm_utils as helpers
@@ -158,7 +159,7 @@ def test_fp8_torch_baseline_does_not_cache_inputs():
     utils.train_assert_equal(third.cpu(), torch.full((1, 2), 15.0, dtype=x.dtype))
 
 
-@pytest.mark.parametrize("m", (1, 17))
+@pytest.mark.parametrize("m", (1, 17, 1024))
 def test_fp8_gemm_does_not_cache_inputs(m):
     """Fused and workspace paths must observe input mutations on every call."""
     device = flag_train.device
@@ -190,7 +191,7 @@ def fp8_environment():
 
 @pytest.fixture(scope="module")
 def selected_baseline():
-    # Explicit Ascend/MetaX Torch baselines must not import DeepSpeed. Others
+    # Explicit Torch baselines must not import DeepSpeed. Other vendors
     # still require it; missing/build-broken baselines never imply a pass.
     metadata = baseline_metadata()
     print("FP8_GEMM_BASELINE " + json.dumps(metadata, sort_keys=True))
@@ -297,6 +298,12 @@ EDGE_CASES = (
     ("large_m_partial_tiles", 513, 256, 384, 128),
     ("noncontiguous_activation_large_m", 513, 256, 256, 128),
     ("large_m_generic_layout", 512, 133, 77, 17),
+    ("large_m_before_workspace", 1023, 256, 256, 128),
+    ("large_m_at_workspace", 1024, 256, 256, 128),
+    ("large_m_workspace_partial_tile", 1025, 256, 256, 128),
+    ("noncontiguous_activation_workspace", 1025, 256, 256, 128),
+    ("large_m_workspace_unaligned_k", 1024, 133, 256, 128),
+    ("large_m_workspace_other_group", 1024, 256, 256, 96),
     ("empty_m", 0, 17, 19, 7),
     ("empty_n", 3, 17, 0, 7),
     ("empty_k", 3, 0, 19, 7),
@@ -488,7 +495,7 @@ def test_fp8_gemm_portable_path_without_deepspeed(monkeypatch):
     assert_fp8_close(actual, torch_reference(x, weight, scale, 17))
 
 
-@pytest.mark.parametrize("vendor", ("ascend", "metax"))
+@pytest.mark.parametrize("vendor", ("ascend", "metax", "hygon"))
 def test_fp8_torch_baseline_without_deepspeed(monkeypatch, vendor):
     """Exercise metadata, inputs and the full Torch path without the DS loader."""
     from . import _fp8_gemm_utils as helpers

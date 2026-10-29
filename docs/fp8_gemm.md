@@ -14,6 +14,10 @@ the same generic fused kernel with a larger K tile for aligned medium-M BF16.
 A MetaX override in
 `src/flag_train/runtime/backend/_metax/ops/deepspeed/fp8_gemm_triton.py` uses
 a fused small-M path and separate decode/GEMM kernels for eligible larger BF16 inputs.
+A Hygon override in
+`src/flag_train/runtime/backend/_hygon/ops/deepspeed/fp8_gemm_triton.py` reuses
+the generic fused kernel with smaller tiles for nonaligned inputs and scale groups,
+and uses separate Triton decode/GEMM kernels for eligible large BF16 inputs.
 Output has the activation dtype. The API is forward-only. Weights are not
 `torch.float8_e4m3fn`: byte zero represents `2**-7` before scaling; groups index
 flattened `[K, N]` elements. Production code imports no DeepSpeed helpers.
@@ -34,14 +38,14 @@ rerun on NVIDIA hardware. The generic default scale-broadcast policy is retained
 dated NVIDIA results below are historical, not physical regression results for
 this revision. T-Head (`thead`) passed the dated original-DeepSpeed validation
 below after adding a launch-policy override. MetaX (`metax`) results are recorded
-separately below. Hygon (`hygon`) and other backends are **pending hardware validation**, not claimed supported
-or fast merely by collecting tests. The additional medium-M boundary tests
+separately below. Hygon (`hygon`) validation is documented below; other unmeasured
+backends are not claimed supported or fast merely by collecting tests. The medium-M boundary tests
 have not been physically rerun on NVIDIA or Ascend.
 Existing FP16 entry points, gradients and end-to-end training are not covered.
 
-On NVIDIA, T-Head and other vendors except Ascend/MetaX, the baseline remains the **unmodified**
+On NVIDIA, T-Head and other vendors except Ascend/MetaX/Hygon, the baseline remains the **unmodified**
 public API `deepspeed.ops.fp_quantizer.matmul_fp8`, with real DeepSpeed quantization.
-On Ascend and MetaX the explicitly selected functional and performance baseline is
+On Ascend, MetaX and Hygon the explicitly selected functional and performance baseline is
 **Torch eager dequantization followed by BF16 `torch.matmul`**. The decoder uses
 a fixed 256-entry FP32 custom E4M3 codebook (1 KiB per device) and
 `torch.index_select`. Every timed call converts all input bytes to int32 indices,
@@ -59,8 +63,8 @@ probes failed on the measured stack; it is not an automatic error fallback.
 
 The vendor policy is fixed, not selected by catching an execution failure.
 Reports identify the baseline mode, input pipeline, timed scope and source hash
-(the Torch helper on Ascend/MetaX, the upstream GEMM source elsewhere). No DeepSpeed
-kernel or launch settings are modified. Ascend/MetaX tests and benchmarks do not
+(the Torch helper on Ascend/MetaX/Hygon, the upstream GEMM source elsewhere). No DeepSpeed
+kernel or launch settings are modified. Ascend/MetaX/Hygon tests and benchmarks do not
 require DeepSpeed. Missing DeepSpeed dependencies on original-baseline
 paths remain errors, not a reason to silently substitute Torch. Portable
 candidate correctness tests also do not import or require DeepSpeed.
@@ -74,8 +78,8 @@ candidate correctness tests also do not import or require DeepSpeed.
    `python -m pytest tests/deepspeed/test_fp8_gemm.py -q -ra -k "not against_baseline"`.
    Add `--ref cpu` to execute decoding and reference matmul on CPU, not simply
    copy a reference result computed on the accelerator.
-3. Except on Ascend/MetaX, install original DeepSpeed and build its FP quantizer.
-   Ascend/MetaX Torch baselines require no DeepSpeed installation. Run the
+3. Except on Ascend/MetaX/Hygon, install original DeepSpeed and build its FP quantizer.
+   Ascend/MetaX/Hygon Torch baselines require no DeepSpeed installation. Run the
    full correctness and default performance commands below. Baseline build,
    execution and numerical failures remain visible failures. Only the narrowly
    identified NVIDIA H20 limitation below is skipped.
@@ -561,6 +565,62 @@ repository at
 Earlier failed generic-kernel runs and tuning diagnostics are retained separately;
 they are not replaced by these final results. NVIDIA has not been physically
 rerun with this shared-test revision.
+
+## Hygon BW validation (2026-10-29)
+
+This validation uses the explicitly approved **Torch dequantization + matmul**
+baseline, not the original DeepSpeed API. The installed DeepSpeed package lacks
+the required public API. A separate unmodified DeepSpeed checkout at
+`79caae1c04fca210345bdeb03bcacf87b1ac2f23` rejects Triton 3.6 in its quantizer
+compatibility check; its unchanged Triton entry also exceeds the BW shared-memory
+limit at M=256 (164864 requested bytes versus 65536 available). Neither upstream
+check nor kernel was patched to obtain acceptance.
+
+Environment: Hygon BW, device 1, Torch 2.7.1, HIP 6.3.25405,
+FlagTree 0.6.1+hcu3.6 / Triton 3.6.0, Python 3.10. The implementation was developed
+on FlagTrain branch `feat/fp8-gemm-nv-bf16`, starting from
+`2c0cf09b77146c1ae64ef0dd973da75cc2629b4c`.
+
+The Hygon override has two paths:
+
+- Small or general inputs reuse the portable fused kernel. Nonaligned K/N or
+  scale groups other than 128 use BM=16/32, BN=64, BK=32, four warps and one stage,
+  resolving the 80 KiB shared-memory requirement seen in a boundary test.
+- BF16 inputs with M>=1024, positive K/N divisible by 128, group size 128 and
+  signed-int32-safe offsets decode once into a temporary BF16 matrix, then run
+  Triton GEMM with BM=128, BN=128, BK=64, grouped-M ordering of 8, four warps and
+  two stages. Both kernels and allocations execute on every call. The workspace
+  costs 2*K*N bytes (64 MiB for the core shapes); decoded weights are never cached.
+
+The Torch baseline includes uint8-to-int32 indices, format lookup, FP32 scaling,
+BF16 conversion, matmul and allocations. Only the input-independent 256-entry
+format table is prepared before timing. Both sides use the same pre-generated
+weights/scales; quantizer performance is outside this comparison. Timing uses
+the existing kernel-mode `triton.testing.do_bench` framework without changing
+the >0.8x requirement or numerical tolerances.
+
+Final results, all without skips:
+
+- Device-reference functionality: **113 passed**.
+- CPU-reference functionality: **113 passed**.
+- Full functionality with DeepSpeed imports blocked: **113 passed**.
+- Performance run 1: **15 timing rows**, **15 passed**, **1.336804x-10.595809x**.
+- Performance run 2: **15 timing rows**, **15 passed**, **1.324970x-10.571010x**.
+- Metadata/dispatch audit: **12 checks passed**. All 15 expected M values are
+  present in each benchmark, including 256, 512, 1024 and 2048.
+
+Ratios are baseline latency / candidate latency. An earlier fused-only run
+failed M=2048 at 0.520283x; that case was optimized, not removed or skipped.
+The seven added boundary/cache checks cover the large-M dispatch transition,
+partial tiles, noncontiguous activation, fallback layouts and fresh inputs.
+Other hardware has not been rerun with these latest shared-test additions.
+
+Raw logs/JSON remain outside the repository under `/root/pangjielong/`, named
+`fp8_hcu_accuracy_final`, `fp8_hcu_accuracy_cpu_final`,
+`fp8_hcu_benchmark_final1`, `fp8_hcu_benchmark_final2`,
+`fp8_hcu_no_deepspeed_final.log` and `fp8_hcu_audit.log`.
+The Torch helper SHA256 recorded in both final benchmark reports is
+`516b1145e63ca625ee704cbeef30c97cf54cad1ffff91d5d172218efc4183844`.
 
 ## Original NVIDIA acceptance before portability refactor (2026-10-14)
 

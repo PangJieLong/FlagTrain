@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Shared FP8 GEMM test/benchmark oracles; never imported by production code.
 
-Ascend and MetaX explicitly use Torch dequantization + matmul as the full baseline;
+Ascend, MetaX and Hygon use Torch dequantization + matmul as the full baseline;
 other vendors retain DeepSpeed's original public API and real quantizer. The
 independent arithmetic oracle and these Torch baselines do not require DeepSpeed.
 Known upstream limitations have a source/version/device-scoped skip policy.
@@ -70,7 +70,7 @@ def baseline_metadata():
         "comparison_scope": "base-and-large; all shapes attempted on every vendor",
         "assertion": "BF16 train_assert_close rtol=.016/atol=.025 and upstream relative error <.004",
     }
-    if flag_train.vendor_name in ("ascend", "metax"):
+    if flag_train.vendor_name in ("ascend", "metax", "hygon"):
         source = Path(__file__).resolve()
         return {
             **common,
@@ -177,11 +177,11 @@ def original_deepspeed_skip_reason(m, k, n, dtype, group_size, device, metadata=
 def make_baseline_inputs(m, k, n, dtype, group_size, device):
     """Build identical operands for both implementations outside timing.
 
-    Ascend and MetaX use Torch dequantization + matmul, with inputs independent
-    of the unsupported NPU quantizer. This is a fixed policy, never an
+    Ascend, MetaX and Hygon use Torch dequantization + matmul, with inputs
+    independent of the DeepSpeed quantizer. This is a fixed policy, never an
     exception-triggered fallback. Other vendors keep real DeepSpeed quantization.
     """
-    if flag_train.vendor_name in ("ascend", "metax"):
+    if flag_train.vendor_name in ("ascend", "metax", "hygon"):
         return (*make_portable_inputs(m, k, n, dtype, group_size, device), None)
     _, QuantizationConfig, FP_Quantize, _, _ = load_deepspeed()
     generator = torch.Generator(device=device).manual_seed(20260922)
@@ -201,7 +201,7 @@ def make_portable_inputs(m, k, n, dtype, group_size, device):
     """Fixed CPU-generated encoded inputs; no vendor RNG or quantizer dependency.
 
     These are valid custom E4M3 bytes, not a replacement for DeepSpeed's
-    quantizer. Ascend and MetaX Torch-baseline comparisons use these operands; other
+    quantizer. Explicit Torch-baseline comparisons use these operands; other
     vendors' original-public-API acceptance continues to use the real quantizer.
     """
     generator = torch.Generator(device="cpu").manual_seed(20260922)
@@ -216,7 +216,7 @@ def make_portable_inputs(m, k, n, dtype, group_size, device):
 
 def baseline_matmul(x, weight, scale, group_size, fpq):
     """Run the explicit vendor baseline; propagate errors without substitution."""
-    if flag_train.vendor_name in ("ascend", "metax"):
+    if flag_train.vendor_name in ("ascend", "metax", "hygon"):
         return torch_composite_matmul(x, weight, scale, group_size)
     return load_deepspeed()[3](x, weight, scale, group_size, fpq)
 
