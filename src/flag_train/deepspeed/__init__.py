@@ -9,6 +9,7 @@ from .fp8_gemm_triton import matmul_fp8_triton
 from .lamb import lamb
 from .lion import multi_tensor_lion
 from .mixed_moe_gemm import mixed_moe_gemm
+from .multi_tensor_adam import multi_tensor_adam
 from .packbits import packbits
 from .unpackbits import unpackbits
 from .wf6af16_linear import wf6af16_linear
@@ -19,6 +20,7 @@ __all__ = [
     "lamb",
     "matmul_fp8_triton",
     "mixed_moe_gemm",
+    "multi_tensor_adam",
     "multi_tensor_lion",
     "packbits",
     "unpackbits",

@@ -9,11 +9,37 @@ description = "Triton-based training operators and compute components for FlagOS
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
-dependencies = []
+requires-python = ">=3.10"
+
+dependencies = [
+    "numpy",
+    "packaging>=23.0",
+    "PyYAML>=6.0.1",
+    "sqlalchemy>=1.4.31,<2.1",
+    "typing_extensions>=4.0",
+]
 
 [project.urls]
 Repository = "https://github.com/flagos-ai/FlagTrain"
 Issues = "https://github.com/flagos-ai/FlagTrain/issues"
+
+[project.optional-dependencies]
+# --- BEGIN auto-generated from backends.yaml ---
+
+# Use `--no-deps` during installation.
+nvidia = [
+    "deepspeed==0.19.8",
+    "deepspeed-kernels",
+    "hjson==3.1.0",     # deps for deepspeed
+    "py-cpuinfo==9.0.0",    # deps for deepspeed
+]
+
+
+# --- END auto-generated from backends.yaml ---
+
+test = [
+    "pytest>=8.0",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]
