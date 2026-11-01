@@ -80,7 +80,7 @@ def _matmul_kernel(
         # Fast broadcast applies only when each tile lies inside one group.
         # Backends may select full indexing when their MMA lowering cannot
         # compile this rank-one scale broadcast; other vendors retain it.
-        if BROADCAST_SCALES and N % GROUP == 0 and GROUP % BN == 0:
+        if BROADCAST_SCALES and (N % GROUP == 0 and GROUP % BN == 0):
             scales = tl.load(
                 S + kk[:, None] * (N // GROUP) + pn * BN // GROUP,
                 kk[:, None] < K,

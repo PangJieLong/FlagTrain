@@ -4,9 +4,9 @@
 
 The mathematical torch oracle is independent of the production bitcast decoder.
 Every core candidate case runs against that oracle. The separate baseline is
-Torch dequantization + matmul on Ascend/MetaX/Hygon, and the original DeepSpeed API on
-other vendors. Only pinned, known-broken NVIDIA baseline cases are skipped;
-candidate/oracle checks are never skipped for baseline limitations.
+Torch dequantization + matmul on Ascend/MetaX/Hygon/Iluvatar, and the original
+DeepSpeed API on other vendors. Only pinned, known-broken NVIDIA baseline cases
+are skipped; candidate/oracle checks are never skipped for baseline limitations.
 
 Inputs are quantized uint8 weights (not differentiable torch float8 tensors),
 so this operator has a forward-only contract and no parameter-gradient tests.
@@ -46,7 +46,30 @@ pytestmark = pytest.mark.fp8_gemm
 DTYPES = (torch.bfloat16,)
 
 
-@pytest.mark.parametrize("vendor", ("ascend", "nvidia", "hygon", "thead", "metax"))
+@pytest.mark.parametrize("zero_scale", (False, True))
+def test_fp8_gemm_large_decoder_codes(zero_scale):
+    """Cover all encodings and flat scales in large-M workspace paths."""
+    generator = torch.Generator(device="cpu").manual_seed(20260922)
+    x = (torch.randn((512, 128), generator=generator) * 0.25).to(torch.bfloat16)
+    weight = (torch.arange(128 * 256) % 256).to(torch.uint8).reshape(128, 256)
+    scale = 0.123 + 0.037 * (torch.arange(256, dtype=torch.float32) % 7)
+    scale[::7] = 0
+    if zero_scale:
+        scale.zero_()
+    x, weight, scale = (t.to(flag_train.device) for t in (x, weight, scale))
+    actual = matmul_fp8_triton(x, weight, scale, 128)
+    reference = torch_reference(x, weight, scale, 128)
+    if zero_scale:
+        utils.train_assert_equal(
+            utils.to_reference(actual), utils.to_reference(reference)
+        )
+    else:
+        assert_fp8_close(actual, reference, mean_relative=False)
+
+
+@pytest.mark.parametrize(
+    "vendor", ("ascend", "nvidia", "hygon", "thead", "metax", "iluvatar")
+)
 def test_fp8_baseline_entry_policy(monkeypatch, vendor):
     """Explicit Torch vendors and original public API signatures stay intact."""
     from . import _fp8_gemm_utils as helpers
@@ -67,6 +90,7 @@ def test_fp8_baseline_entry_policy(monkeypatch, vendor):
             "ascend",
             "metax",
             "hygon",
+            "iluvatar",
         ), "Torch paths must not import DeepSpeed"
         return None, None, None, public, None
 
@@ -77,13 +101,13 @@ def test_fp8_baseline_entry_policy(monkeypatch, vendor):
     assert helpers.baseline_matmul(*operands) is result
     expected = (
         ("torch", operands[:4])
-        if vendor in ("ascend", "metax", "hygon")
+        if vendor in ("ascend", "metax", "hygon", "iluvatar")
         else ("public", operands)
     )
     assert calls == [expected]
 
 
-@pytest.mark.parametrize("vendor", ("ascend", "metax", "hygon", "nvidia"))
+@pytest.mark.parametrize("vendor", ("ascend", "metax", "hygon", "iluvatar", "nvidia"))
 def test_fp8_baseline_failure_is_not_replaced(monkeypatch, vendor):
     """Both selected baselines propagate errors, without an implicit fallback."""
     from . import _fp8_gemm_utils as helpers
@@ -460,7 +484,7 @@ def test_fp8_gemm_invalid_inputs(case, error):
         matmul_fp8_triton(x, weight, scale, group)
 
 
-@pytest.mark.parametrize("vendor", ("ascend", "hygon", "thead", "metax"))
+@pytest.mark.parametrize("vendor", ("ascend", "hygon", "thead", "metax", "iluvatar"))
 def test_fp8_gemm_h20_skip_is_nvidia_only(monkeypatch, vendor):
     """Policy test, not evidence of execution on the named hardware."""
     monkeypatch.setattr(flag_train, "vendor_name", vendor)
@@ -495,7 +519,7 @@ def test_fp8_gemm_portable_path_without_deepspeed(monkeypatch):
     assert_fp8_close(actual, torch_reference(x, weight, scale, 17))
 
 
-@pytest.mark.parametrize("vendor", ("ascend", "metax", "hygon"))
+@pytest.mark.parametrize("vendor", ("ascend", "metax", "hygon", "iluvatar"))
 def test_fp8_torch_baseline_without_deepspeed(monkeypatch, vendor):
     """Exercise metadata, inputs and the full Torch path without the DS loader."""
     from . import _fp8_gemm_utils as helpers

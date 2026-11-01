@@ -27,6 +27,7 @@ it here (``from .lamb import lamb``) and list it in ``__all__``, which is what
 """
 
 from .blocked_flash import blocked_flash
+from .fp8_gemm_triton import matmul_fp8_triton
 from .wf6af16_linear import wf6af16_linear
 
-__all__ = ["blocked_flash", "wf6af16_linear"]
+__all__ = ["blocked_flash", "matmul_fp8_triton", "wf6af16_linear"]
