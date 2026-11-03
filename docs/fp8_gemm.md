@@ -5,17 +5,17 @@ Public API:
 The generic implementation in `src/flag_train/deepspeed/fp8_gemm_triton.py` fuses
 DeepSpeed custom uint8 E4M3 decoding, scaling and GEMM with FP32 accumulation.
 An Ascend override in
-`src/flag_train/runtime/backend/_ascend/ops/deepspeed/fp8_gemm_triton.py` uses
+`src/flag_train/runtime/backend/_ascend/deepspeed/fp8_gemm_triton.py` uses
 separate Triton decode and GEMM kernels for selected large-M BF16 inputs and
 delegates other supported inputs to the generic implementation's default policy.
 A T-Head override in
-`src/flag_train/runtime/backend/_thead/ops/deepspeed/fp8_gemm_triton.py` reuses
+`src/flag_train/runtime/backend/_thead/deepspeed/fp8_gemm_triton.py` reuses
 the same generic fused kernel with a larger K tile for aligned medium-M BF16.
 A MetaX override in
-`src/flag_train/runtime/backend/_metax/ops/deepspeed/fp8_gemm_triton.py` uses
+`src/flag_train/runtime/backend/_metax/deepspeed/fp8_gemm_triton.py` uses
 a fused small-M path and separate decode/GEMM kernels for eligible larger BF16 inputs.
 A Hygon override in
-`src/flag_train/runtime/backend/_hygon/ops/deepspeed/fp8_gemm_triton.py` reuses
+`src/flag_train/runtime/backend/_hygon/deepspeed/fp8_gemm_triton.py` reuses
 the generic fused kernel with smaller tiles for nonaligned inputs and scale groups,
 and uses separate Triton decode/GEMM kernels for eligible large BF16 inputs.
 Output has the activation dtype. The API is forward-only. Weights are not
@@ -103,10 +103,10 @@ candidate correctness tests also do not import or require DeepSpeed.
    performance runs use the same shared suites and unchanged 15 core shapes.
 
 Vendor implementations can follow the existing Hygon component layout under
-`src/flag_train/runtime/backend/_<vendor>/ops/deepspeed/`. Re-export the same
+`src/flag_train/runtime/backend/_<vendor>/deepspeed/`. Re-export the same
 `matmul_fp8_triton` name in that package's `__init__.py` and include it in
-`__all__`; the runtime discovers the backend ops package and its subpackages.
-`SpecOpRegistrar` in `flag_train.deepspeed` replaces the generic export when an
+`__all__`; the runtime discovers the backend component package and its subpackages.
+`SpecOpRegistrar` invoked by `flag_train/__init__.py` replaces the generic export when an
 override exists; both test suites call that public export. The Ascend package's
 `__init__.py` registers its FP8 GEMM override through this mechanism, as do the
 T-Head and MetaX packages described below.
@@ -148,7 +148,7 @@ and ensure that the intended venv's Triton is imported before running tests.
 ### Iluvatar implementation and validation (2026-10-30)
 
 The override is registered under
-`src/flag_train/runtime/backend/_iluvatar/ops/deepspeed/fp8_gemm_triton.py`.
+`src/flag_train/runtime/backend/_iluvatar/deepspeed/fp8_gemm_triton.py`.
 BF16 inputs with M>=512, positive K/N divisible by 128, group size 128, and
 signed-int32-safe weight/output/activation offsets use two Triton kernels:
 decode to a newly allocated BF16 workspace, then GEMM with BM=128, BN=128,
