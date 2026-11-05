@@ -236,6 +236,29 @@ python3 -m pip install "${pip_args[@]}" --upgrade "setuptools>=77"
 # A native runner's fresh venv has none of them; a prebuilt image does.
 python3 -m pip install "${pip_args[@]}" pybind11==3.0.3 ninja==1.13.0
 
+install_compiler() {
+    # T-Head's large wheel can be truncated by the package server. Start a
+    # fresh pip process on retry; keep index hashes and --no-cache-dir intact.
+    # A persistently invalid artifact must still fail the job.
+    local attempts=1 attempt status
+    if [ "${BACKEND}" = "thead" ]; then
+        attempts=3
+        set -- --timeout 120 --retries 5 "$@"
+    fi
+    for ((attempt = 1; attempt <= attempts; attempt++)); do
+        if python3 -m pip install "$@"; then
+            return 0
+        else
+            status=$?
+        fi
+        if [ "${attempt}" -lt "${attempts}" ]; then
+            echo "compiler install failed (${status}); retry ${attempt}/${attempts}" >&2
+            sleep "$((attempt * 5))"
+        fi
+    done
+    return "${status}"
+}
+
 # The vendor stack goes in first, so a backend's own pins win where they
 # overlap with FlagTrain's metadata (iluvatar's `numpy<2`, for one). Skipped
 # when the image already ships the stack.
@@ -243,7 +266,7 @@ if [ "${PREBUILT}" -eq 0 ]; then
     if [ -n "${COMPILER_PKG}" ]; then
         echo "installing ${BACKEND} compiler (${COMPILER_PKG})"
         # shellcheck disable=SC2086
-        python3 -m pip install "${pip_args[@]}" ${COMPILER_PKG}
+        install_compiler "${pip_args[@]}" ${COMPILER_PKG}
     fi
     if [ -n "${DEPS}" ]; then
         echo "installing ${BACKEND} deps (${DEPS# })"
@@ -251,6 +274,12 @@ if [ "${PREBUILT}" -eq 0 ]; then
         # shellcheck disable=SC2086
         python3 -m pip install "${pip_args[@]}" ${DEPS}
     fi
+fi
+
+# DeepSpeed 0.19.7 has a source-level name collision in its FP quantizer.
+# This audited setup-only repair leaves its FP8 GEMM and launch unchanged.
+if [ "${BACKEND}" = "nvidia-cuda133" ]; then
+    python3 "${REPO_ROOT}/tools/repair_deepspeed_fp_quantizer.py"
 fi
 
 # FlagTrain plus its test dependencies, as declared in pyproject.toml's

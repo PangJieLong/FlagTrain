@@ -70,10 +70,46 @@ quantizer failed; this does not imply acceptance against original DeepSpeed.
 The vendor policy is fixed, not selected by catching an execution failure.
 Reports identify the baseline mode, input pipeline, timed scope and source hash
 (the Torch helper on Ascend/MetaX/Hygon/Iluvatar, the upstream GEMM source
-elsewhere). No DeepSpeed kernel or launch settings are modified.
+elsewhere). No DeepSpeed FP8 GEMM kernel or launch settings are modified.
+NVIDIA CI applies the explicitly documented DeepSpeed 0.19.7 quantizer repair
+below before building that dependency; this is not an unmodified quantizer.
 Ascend/MetaX/Hygon/Iluvatar tests and benchmarks do not require DeepSpeed. Missing DeepSpeed dependencies on original-baseline
 paths remain errors, not a reason to silently substitute Torch. Portable
 candidate correctness tests also do not import or require DeepSpeed.
+
+## CI dependency repair (2026-11-05)
+
+NVIDIA CI's DeepSpeed 0.19.7 cannot compile its FP quantizer: both CUDA
+dequantizers declare `q_exponent_bits` as a template parameter and again as a
+local constant. The parameter describes the encoded input, while the local
+constant must describe the FP16/BF16 output. `tools/setup_env.sh` invokes
+`tools/repair_deepspeed_fp_quantizer.py` only for `nvidia-cuda133`. With explicit
+approval, this setup-only repair restores the distinct output exponent width
+in the declaration, exponent sentinel check, destination bias and sign shift in
+both functions. The input masks, quantization function, Python public API,
+FP8 GEMM source and launch configuration remain unchanged. Tests still use
+real DeepSpeed quantization and its original public GEMM entry, with the same
+shapes, tolerances and speedup threshold; no failure is converted into a skip.
+
+The script checks the exact package version and source hashes, is idempotent,
+and refuses unknown source instead of applying a best-effort patch. It logs
+these fingerprints in CI (SHA256 of exact bytes):
+
+- Original quantizer: `cf52494decbde30cd5d8d3413951123a70a568af35c99fefde5ecc1c8b52e923`.
+- Repaired quantizer: `8f61258c9b479a615d1130322b9e8dad6c1954a991e3c460c411aa6a08484d78`.
+- Unchanged GEMM: `5c376c95cca24995283a13ca2a6ec7773cbad20aaa90e74e0ea7a18fe8826096`.
+
+T-Head CI previously failed while downloading its compiler wheel, before any
+operator test. Compiler installation now makes at most three fresh pip
+attempts with caching disabled. Package-index hash verification is retained;
+a persistently incorrect/truncated artifact still fails setup. This does not
+change package pins or establish that the package server itself is repaired.
+
+CPU setup regressions run with `python -m unittest discover -s tools/tests -v`.
+They cover source/version/hash guards, idempotence, unchanged GEMM, and bounded
+installer retry behavior. These checks do not replace CUDA compilation,
+device correctness or performance validation; new hardware CI results are
+required before claiming this revision passes acceptance.
 
 ## Cross-platform workflow
 
