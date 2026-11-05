@@ -276,12 +276,6 @@ if [ "${PREBUILT}" -eq 0 ]; then
     fi
 fi
 
-# DeepSpeed 0.19.7 has a source-level name collision in its FP quantizer.
-# This audited setup-only repair leaves its FP8 GEMM and launch unchanged.
-if [ "${BACKEND}" = "nvidia-cuda133" ]; then
-    python3 "${REPO_ROOT}/tools/repair_deepspeed_fp_quantizer.py"
-fi
-
 # FlagTrain plus its test dependencies, as declared in pyproject.toml's
 # `[test]` extra (pytest only). The reference packages the tests import
 # (megatron-core) are declared in `deps:` above, next to the vendor stack, and

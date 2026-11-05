@@ -33,6 +33,15 @@ def kernel(name):
 
 
 class QuantizerRepairTests(unittest.TestCase):
+    def test_nvidia_image_runs_repair_after_install(self):
+        dockerfile = (TOOLS.parent / ".github/docker/gpu-runner.Dockerfile").read_text(
+            encoding="utf-8"
+        )
+        copy = "COPY tools/repair_deepspeed_fp_quantizer.py "
+        run = "RUN python3 /opt/flagtrain-ci/repair_deepspeed_fp_quantizer.py"
+        self.assertLess(dockerfile.index('"deepspeed==0.19.7"'), dockerfile.index(copy))
+        self.assertLess(dockerfile.index(copy), dockerfile.index(run))
+
     def setUp(self):
         self.source = (
             "// untouched quantization\n"

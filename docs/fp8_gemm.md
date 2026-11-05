@@ -82,8 +82,9 @@ candidate correctness tests also do not import or require DeepSpeed.
 NVIDIA CI's DeepSpeed 0.19.7 cannot compile its FP quantizer: both CUDA
 dequantizers declare `q_exponent_bits` as a template parameter and again as a
 local constant. The parameter describes the encoded input, while the local
-constant must describe the FP16/BF16 output. `tools/setup_env.sh` invokes
-`tools/repair_deepspeed_fp_quantizer.py` only for `nvidia-cuda133`. With explicit
+constant must describe the FP16/BF16 output. The NVIDIA CI Dockerfile invokes
+`tools/repair_deepspeed_fp_quantizer.py` after installing DeepSpeed. This job
+uses the image directly and does not execute `tools/setup_env.sh`. With explicit
 approval, this setup-only repair restores the distinct output exponent width
 in the declaration, exponent sentinel check, destination bias and sign shift in
 both functions. The input masks, quantization function, Python public API,
