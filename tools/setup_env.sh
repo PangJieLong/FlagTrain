@@ -283,5 +283,14 @@ fi
 # pyyaml/sqlalchemy/numpy/packaging come from the package's core dependencies.
 python3 -m pip install "${pip_args[@]}" --no-build-isolation -e "${REPO_ROOT}[test]"
 
+# T-Head uses the original DeepSpeed FP8 API, not the Torch-composite baseline.
+# Repair the same pinned upstream quantizer source as the NVIDIA image, then
+# fail setup immediately if the required public imports are unavailable.
+# Device selection and the actual quantizer JIT build remain in the GPU tests.
+if [ "${BACKEND}" = "thead" ]; then
+    python3 "${REPO_ROOT}/tools/repair_deepspeed_fp_quantizer.py"
+    python3 -c "from deepspeed.linear import QuantizationConfig; from deepspeed.ops.fp_quantizer import FP_Quantize, matmul_fp8; print('DeepSpeed FP8 baseline imports available')"
+fi
+
 echo "checking that FlagTrain imports on this platform"
 python3 -c "import flag_train; print('flag_train:', flag_train.vendor_name, '/', flag_train.device)"

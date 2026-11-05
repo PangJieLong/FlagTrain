@@ -125,6 +125,48 @@ class QuantizerRepairTests(unittest.TestCase):
 
 
 class CompilerRetryTests(unittest.TestCase):
+    def test_thead_pins_required_baseline(self):
+        config = (TOOLS.parent / "backends.yaml").read_text(encoding="utf-8")
+        thead = config.split("\n  thead:\n", 1)[1]
+        self.assertIn("- deepspeed==0.19.7", thead)
+
+    def test_thead_baseline_setup_is_scoped_and_fails_closed(self):
+        bash = shutil.which("bash")
+        if not bash:
+            self.skipTest("bash required for setup shell tests")
+        script = (TOOLS / "setup_env.sh").read_text(encoding="utf-8")
+        marker = "# T-Head uses the original DeepSpeed FP8 API"
+        start = script.index(marker)
+        self.assertLess(script.index('-e "${REPO_ROOT}[test]"'), start)
+        block = script[start : script.index('\necho "checking that FlagTrain', start)]
+        stub = 'python3() { printf "CALL %s\\n" "$*"; return "$FAIL_STATUS"; }\n'
+        for backend, failure, expected_calls in (
+            ("thead", "0", 2),
+            ("thead", "23", 1),
+            ("ascend-cann900", "0", 0),
+            ("nvidia-cuda133", "0", 0),
+        ):
+            with self.subTest(backend=backend, failure=failure):
+                result = subprocess.run(
+                    [bash, "--noprofile", "--norc", "-e", "-c", stub + block],
+                    env=dict(
+                        os.environ,
+                        BACKEND=backend,
+                        FAIL_STATUS=failure,
+                        REPO_ROOT="/repo",
+                    ),
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(result.returncode, int(failure), result.stderr)
+                self.assertEqual(result.stdout.count("CALL "), expected_calls)
+                if expected_calls:
+                    self.assertIn(
+                        "/repo/tools/repair_deepspeed_fp_quantizer.py", result.stdout
+                    )
+                if expected_calls == 2:
+                    self.assertIn("FP_Quantize, matmul_fp8", result.stdout)
+
     def run_install(self, backend, failures):
         bash = shutil.which("bash")
         if not bash:

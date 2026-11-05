@@ -106,6 +106,15 @@ attempts with caching disabled. Package-index hash verification is retained;
 a persistently incorrect/truncated artifact still fails setup. This does not
 change package pins or establish that the package server itself is repaired.
 
+The next T-Head run reached testing but failed to import `deepspeed` after
+43 checks passed. Its `backends.yaml` dependency list now includes
+`deepspeed==0.19.7`. After installation, T-Head setup applies the same audited
+quantizer repair and checks the required public API imports. The GEMM remains
+unmodified, with real DeepSpeed quantization; no Torch fallback or new skip is
+introduced. The quantizer is JIT-built by the device tests after device
+selection, not during environment setup. Passing import checks alone does not
+establish PPU compilation, correctness or performance acceptance.
+
 CPU setup regressions run with `python -m unittest discover -s tools/tests -v`.
 They cover source/version/hash guards, idempotence, unchanged GEMM, and bounded
 installer retry behavior. These checks do not replace CUDA compilation,

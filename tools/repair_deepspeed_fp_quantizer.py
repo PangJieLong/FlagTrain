@@ -5,7 +5,7 @@
 The upstream rename conflates input FP8 and output FP16/BF16 exponent widths
 in two dequantizers. Restore distinct names and the output bias/sign width.
 Quantization, Python APIs and the timed FP8 GEMM are not modified.
-Run explicitly from NVIDIA CI setup, never from operator/test execution.
+Run explicitly from CI environment setup, never from operator/test execution.
 """
 
 import hashlib
