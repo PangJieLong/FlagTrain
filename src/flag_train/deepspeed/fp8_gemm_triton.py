@@ -189,7 +189,7 @@ def fp8_gemm_triton(inp, weight, scale, quantization_group_size):
     Tail tiles and zero-size dimensions are supported. No quantization,
     dequantization workspace, output cache, or host-device copy is used.
     """
-    logger.debug("TRAIN FP8 GEMM")
+    logger.debug("TRAIN FP8_GEMM_TRITON")
     _validate(inp, weight, scale, quantization_group_size)
     return _launch(inp, weight, scale, quantization_group_size)
 

@@ -87,7 +87,7 @@ def fp8_gemm_triton(inp, weight, scale, quantization_group_size):
     It is allocated and populated afresh in every call. No Torch computation
     or DeepSpeed operator is used by this implementation.
     """
-    logger.debug("TRAIN_ASCEND FP8 GEMM")
+    logger.debug("TRAIN_ASCEND FP8_GEMM_TRITON")
     _validate(inp, weight, scale, quantization_group_size)
     m, k = inp.shape
     n = weight.shape[1]

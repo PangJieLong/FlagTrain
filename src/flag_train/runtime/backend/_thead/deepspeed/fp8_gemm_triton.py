@@ -29,7 +29,7 @@ def _decode_fp8_bf16(W, S, D, NUMEL: tl.constexpr):
 
 def fp8_gemm_triton(inp, weight, scale, quantization_group_size):
     """Decode weights once for aligned large-M BF16, then use the PPU GEMM."""
-    logger.debug("TRAIN_THEAD FP8 GEMM")
+    logger.debug("TRAIN_THEAD FP8_GEMM_TRITON")
     _validate(inp, weight, scale, quantization_group_size)
     m, k = inp.shape
     n = weight.shape[1]

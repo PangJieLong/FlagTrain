@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """MetaX FP8 GEMM with a fused small-M path and per-call BF16 workspace."""
 
+import logging
+
 import torch
 import triton
 import triton.language as tl
@@ -9,6 +11,8 @@ import triton.language as tl
 from flag_train.deepspeed.fp8_gemm_triton import _launch, _validate
 from flag_train.runtime import torch_device_fn
 from flag_train.utils import libentry
+
+logger = logging.getLogger(__name__)
 
 
 @libentry()
@@ -94,6 +98,7 @@ def fp8_gemm_triton(inp, weight, scale, quantization_group_size):
     failing rank-one scale broadcast and uses full flattened group indexing.
     The shared kernel's default remains unchanged for other vendors.
     """
+    logger.debug("TRAIN_METAX FP8_GEMM_TRITON")
     _validate(inp, weight, scale, quantization_group_size)
     m, k = inp.shape
     n = weight.shape[1]

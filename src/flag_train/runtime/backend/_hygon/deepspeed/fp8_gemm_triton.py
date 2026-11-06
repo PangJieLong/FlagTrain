@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Hygon FP8 GEMM with bounded fused tiles and a large-M BF16 workspace."""
 
+import logging
+
 import torch
 import triton
 import triton.language as tl
@@ -9,6 +11,8 @@ import triton.language as tl
 from flag_train.deepspeed.fp8_gemm_triton import _launch, _validate
 from flag_train.runtime import torch_device_fn
 from flag_train.utils import libentry
+
+logger = logging.getLogger(__name__)
 
 
 @libentry()
@@ -90,6 +94,7 @@ def fp8_gemm_triton(inp, weight, scale, quantization_group_size):
     workspace is never cached. General scale layouts use smaller fused tiles
     and one pipeline stage to fit BW's 64 KiB shared-memory limit.
     """
+    logger.debug("TRAIN_HYGON FP8_GEMM_TRITON")
     _validate(inp, weight, scale, quantization_group_size)
     m, k = inp.shape
     n = weight.shape[1]

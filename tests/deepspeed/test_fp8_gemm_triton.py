@@ -1,6 +1,6 @@
 # Copyright 2026 FlagOS Contributors
 # SPDX-License-Identifier: Apache-2.0
-"""Check FP8 GEMM against independent arithmetic and the Torch baseline."""
+"""Check FP8 GEMM through its public interface against independent arithmetic."""
 
 import contextlib
 import math
@@ -9,23 +9,30 @@ import pytest
 import torch
 
 import flag_train
-from baseline.deepspeed.fp8_gemm_triton import (
-    CORE_GROUP_SIZE,
-    CORE_K,
-    CORE_M,
-    CORE_N,
-    make_portable_inputs,
-    torch_composite_matmul,
-    torch_dequantize_custom_e4m3,
-)
 from flag_train.deepspeed import fp8_gemm_triton
 
 from .. import accuracy_utils as utils
 
 pytestmark = pytest.mark.fp8_gemm_triton
 DTYPES = (torch.bfloat16,)
+CORE_M = (1, 2, 4, 8, 16, 17, 32, 48, 64, 96, 128, 256, 512, 1024, 2048)
+CORE_K = 4096
+CORE_N = 8192
+CORE_GROUP_SIZE = 128
 ATOL = {torch.bfloat16: 0.025}
 LARGE_M = (256, 512, 1024, 2048)
+
+
+def make_test_inputs(m, k, n, dtype, group_size, device):
+    """Generate deterministic encoded weights without a quantizer."""
+    generator = torch.Generator(device="cpu").manual_seed(20260922)
+    x = torch.randn(m, k, generator=generator).to(dtype)
+    magnitude = torch.randint(32, 88, (k, n), generator=generator, dtype=torch.int32)
+    sign = torch.randint(0, 2, (k, n), generator=generator, dtype=torch.int32)
+    weight = (magnitude | (sign << 7)).to(torch.uint8)
+    groups = (k * n + group_size - 1) // group_size
+    scale = 0.125 + 0.125 * torch.rand(groups, 1, generator=generator)
+    return x.to(device), weight.to(device), scale.to(device)
 
 
 @contextlib.contextmanager
@@ -151,36 +158,6 @@ def test_fp8_gemm_triton_large_decoder_codes(zero_scale):
         assert_fp8_close(actual, reference, mean_relative=False)
 
 
-@pytest.mark.parametrize("group_size", (1, 17, 128, 256, 512))
-@pytest.mark.parametrize("dtype", (torch.bfloat16, torch.float32))
-def test_fp8_torch_baseline_decoder(group_size, dtype):
-    """Exact agreement on all codes, zero/non-power scales and partial groups."""
-    weight = torch.arange(256).to(torch.uint8).reshape(16, 16).to(flag_train.device)
-    groups = triton_cdiv(weight.numel(), group_size)
-    scale = (torch.arange(groups, dtype=torch.float32) % 7) * 0.037 + 0.123
-    if groups > 1:
-        scale[0] = 0
-    scale = scale.reshape(-1, 1).to(flag_train.device)
-    actual = torch_dequantize_custom_e4m3(weight, scale, group_size, dtype)
-    expected = decode_custom_e4m3(weight.cpu(), scale.cpu(), group_size, dtype)
-    utils.train_assert_equal(actual.cpu(), expected)
-
-
-def test_fp8_torch_baseline_does_not_cache_inputs():
-    device = flag_train.device
-    x = torch.ones((1, 2), dtype=torch.bfloat16, device=device)
-    weight = torch.tensor([[0, 1], [2, 3]], dtype=torch.uint8, device=device)
-    scale = torch.full((2, 1), 1 / 128, dtype=torch.float32, device=device)
-    first = torch_composite_matmul(x, weight, scale, 2)
-    weight.fill_(127)
-    second = torch_composite_matmul(x, weight, scale, 2)
-    scale.mul_(2)
-    third = torch_composite_matmul(x, weight, scale, 2)
-    assert not torch.equal(first, second)
-    utils.train_assert_equal(second.cpu(), torch.full((1, 2), 7.5, dtype=x.dtype))
-    utils.train_assert_equal(third.cpu(), torch.full((1, 2), 15.0, dtype=x.dtype))
-
-
 @pytest.mark.parametrize("m", (1, 17, 1024))
 def test_fp8_gemm_triton_does_not_cache_inputs(m):
     """Fused and workspace paths must observe input mutations on every call."""
@@ -221,7 +198,7 @@ def fp8_environment():
 )
 def core_case(request):
     m, dtype = request.param
-    x, weight, scale = make_portable_inputs(
+    x, weight, scale = make_test_inputs(
         m, CORE_K, CORE_N, dtype, CORE_GROUP_SIZE, flag_train.device
     )
     reference = torch_reference(x, weight, scale, CORE_GROUP_SIZE)
@@ -234,8 +211,6 @@ def test_fp8_gemm_triton_candidate_vs_torch(core_case, record_property):
     record_property("shape_group", "large-m" if x.shape[0] in LARGE_M else "base")
     actual = fp8_gemm_triton(x, weight, scale, CORE_GROUP_SIZE)
     assert_fp8_close(actual, reference)
-    baseline = torch_composite_matmul(x, weight, scale, CORE_GROUP_SIZE)
-    assert_fp8_close(baseline, reference)
 
 
 # All shapes below are tested against the mathematical oracle, not broadened
