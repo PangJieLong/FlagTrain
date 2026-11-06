@@ -7,7 +7,13 @@ import math
 import pytest
 
 import flag_train
-from baseline.deepspeed.fp8_gemm_triton import DTYPES, OP_NAME, build_inputs, grid, native
+from baseline.deepspeed.fp8_gemm_triton import (
+    DTYPES,
+    OP_NAME,
+    build_inputs,
+    grid,
+    native,
+)
 from flag_train.deepspeed import fp8_gemm_triton
 
 from .. import base
@@ -26,9 +32,10 @@ class Fp8GemmBenchmark(base.GenericBenchmark):
         metric = super()._measure_input(inputs, case_id=case_id)
         assert metric.error_msg is None, f"{case_id}: {metric.error_msg}"
         if metric.speedup is not None:
-            assert math.isfinite(metric.speedup) and metric.speedup > 0.8, (
-                f"{case_id}: speedup {metric.speedup}x must be > 0.8x"
-            )
+            label = case_id or metric.shape_detail
+            assert (
+                math.isfinite(metric.speedup) and metric.speedup > 0.8
+            ), f"{label}: speedup {metric.speedup}x must be > 0.8x"
         return metric
 
 

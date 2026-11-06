@@ -32,12 +32,10 @@ L2. To specialise another, define it under this package, re-export it here
 
 from .blocked_flash import blocked_flash
 from .cuda_wf6af16_linear import cuda_wf6af16_linear
-from .fp8_gemm_triton import fp8_gemm_triton
 from .mixed_gemm import mixed_gemm
 
 __all__ = [
     "blocked_flash",
     "cuda_wf6af16_linear",
-    "fp8_gemm_triton",
     "mixed_gemm",
 ]

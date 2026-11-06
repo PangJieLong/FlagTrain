@@ -151,7 +151,6 @@ def test_fp8_gemm_triton_large_decoder_codes(zero_scale):
         assert_fp8_close(actual, reference, mean_relative=False)
 
 
-
 @pytest.mark.parametrize("group_size", (1, 17, 128, 256, 512))
 @pytest.mark.parametrize("dtype", (torch.bfloat16, torch.float32))
 def test_fp8_torch_baseline_decoder(group_size, dtype):
@@ -165,7 +164,6 @@ def test_fp8_torch_baseline_decoder(group_size, dtype):
     actual = torch_dequantize_custom_e4m3(weight, scale, group_size, dtype)
     expected = decode_custom_e4m3(weight.cpu(), scale.cpu(), group_size, dtype)
     utils.train_assert_equal(actual.cpu(), expected)
-
 
 
 def test_fp8_torch_baseline_does_not_cache_inputs():
