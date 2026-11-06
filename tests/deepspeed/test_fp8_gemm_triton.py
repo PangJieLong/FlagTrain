@@ -9,7 +9,6 @@ import pytest
 import torch
 
 import flag_train
-from flag_train.deepspeed import fp8_gemm_triton
 
 from .. import accuracy_utils as utils
 
@@ -148,7 +147,7 @@ def test_fp8_gemm_triton_large_decoder_codes(zero_scale):
     if zero_scale:
         scale.zero_()
     x, weight, scale = (t.to(flag_train.device) for t in (x, weight, scale))
-    actual = fp8_gemm_triton(x, weight, scale, 128)
+    actual = flag_train.deepspeed.fp8_gemm_triton(x, weight, scale, 128)
     reference = torch_reference(x, weight, scale, 128)
     if zero_scale:
         utils.train_assert_equal(
@@ -174,7 +173,7 @@ def test_fp8_gemm_triton_does_not_cache_inputs(m):
         weight.fill_(code)
         scale.fill_(scale_value)
         x.fill_(activation)
-        actual = fp8_gemm_triton(x, weight, scale, 128)
+        actual = flag_train.deepspeed.fp8_gemm_triton(x, weight, scale, 128)
         utils.train_assert_equal(
             actual.cpu(), torch.full((m, 128), expected, dtype=x.dtype)
         )
@@ -209,7 +208,7 @@ def test_fp8_gemm_triton_candidate_vs_torch(core_case, record_property):
     """All 15 BF16 candidate shapes run, with the arithmetic reference."""
     x, weight, scale, reference = core_case
     record_property("shape_group", "large-m" if x.shape[0] in LARGE_M else "base")
-    actual = fp8_gemm_triton(x, weight, scale, CORE_GROUP_SIZE)
+    actual = flag_train.deepspeed.fp8_gemm_triton(x, weight, scale, CORE_GROUP_SIZE)
     assert_fp8_close(actual, reference)
 
 
@@ -323,7 +322,7 @@ def test_fp8_gemm_triton_edges(name, m, k, n, group_size, dtype):
         scales = scales.reshape(groups, 1)
     x, weight, scales = (t.to(flag_train.device) for t in (x, weight, scales))
     reference = torch_reference(x, weight, scales, group_size)
-    actual = fp8_gemm_triton(x, weight, scales, group_size)
+    actual = flag_train.deepspeed.fp8_gemm_triton(x, weight, scales, group_size)
     if name in ("all_256_codes", "zero_scale", "empty_m", "empty_n", "empty_k"):
         utils.train_assert_equal(
             utils.to_reference(actual), utils.to_reference(reference)
@@ -402,4 +401,4 @@ def test_fp8_gemm_triton_invalid_inputs(case, error):
     elif case == "noncontiguous_scale":
         scale = torch.full((8,), 1 / 128, dtype=torch.float32, device=device)[::2]
     with pytest.raises(error):
-        fp8_gemm_triton(x, weight, scale, group)
+        flag_train.deepspeed.fp8_gemm_triton(x, weight, scale, group)
