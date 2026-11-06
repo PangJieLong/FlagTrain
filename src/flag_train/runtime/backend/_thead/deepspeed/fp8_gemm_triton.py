@@ -11,7 +11,7 @@ from flag_train.deepspeed.fp8_gemm_triton import _launch, _validate
 logger = logging.getLogger(__name__)
 
 
-def matmul_fp8_triton(inp, weight, scale, quantization_group_size):
+def fp8_gemm_triton(inp, weight, scale, quantization_group_size):
     """Reuse the generic kernel with a larger K tile for aligned medium-M BF16.
 
     BK=128 halves the K-loop count compared with the generic BK=64 policy in

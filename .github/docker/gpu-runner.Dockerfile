@@ -277,11 +277,6 @@ RUN set -eux; \
         pytest pyyaml sqlalchemy; \
     pip list --format=freeze | grep -iE '^(deepspeed|megatron-core|pytest|pyyaml|sqlalchemy|dskernels)'
 
-# Repair the pinned quantizer before any JIT compilation. NVIDIA tests use
-# this image directly and do not execute tools/setup_env.sh.
-COPY tools/repair_deepspeed_fp_quantizer.py /opt/flagtrain-ci/repair_deepspeed_fp_quantizer.py
-RUN python3 /opt/flagtrain-ci/repair_deepspeed_fp_quantizer.py
-
 # --- setuptools for the run-time editable install --------------------------
 # The repo's pyproject needs setuptools>=77 (PEP 639 license-files metadata);
 # torch's own metadata caps it at <82, so the window is [77, 82). With this

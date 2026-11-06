@@ -83,7 +83,7 @@ def _use_two_stage(inp, weight, group_size):
     )
 
 
-def matmul_fp8_triton(inp, weight, scale, quantization_group_size):
+def fp8_gemm_triton(inp, weight, scale, quantization_group_size):
     """Decode once for aligned BF16 M>=1024; fuse other supported inputs.
 
     Both stages and their allocations execute on every call. The 2*K*N-byte

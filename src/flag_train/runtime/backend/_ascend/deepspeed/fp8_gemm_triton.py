@@ -80,7 +80,7 @@ def _matmul_bf16(
     )
 
 
-def matmul_fp8_triton(inp, weight, scale, quantization_group_size):
+def fp8_gemm_triton(inp, weight, scale, quantization_group_size):
     """Same contract as the generic API; large aligned BF16 uses two kernels.
 
     The intermediate is K*N BF16 elements (64 MiB for the core test weights).

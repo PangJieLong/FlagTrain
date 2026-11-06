@@ -154,6 +154,3 @@ backends:
     deps:
       # torch==2.10.0+v0.1.0.ppu2.1.1
       - megatron-core==0.17.1
-      # FP8 GEMM compares against the real DeepSpeed public API/quantizer.
-      # Keep aligned with the audited quantizer repair in setup_env.sh.
-      - deepspeed==0.19.7

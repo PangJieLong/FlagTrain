@@ -181,7 +181,7 @@ def _launch(inp, weight, scale, group_size, config=None, *, broadcast_scales=Tru
     return out
 
 
-def matmul_fp8_triton(inp, weight, scale, quantization_group_size):
+def fp8_gemm_triton(inp, weight, scale, quantization_group_size):
     """Compute [M,K] @ [K,N] with fused FP8 decoding and FP32 accumulation.
 
     Supports BF16/FP16 activations (including noncontiguous activations),
@@ -197,10 +197,10 @@ def matmul_fp8_triton(inp, weight, scale, quantization_group_size):
 def matmul_fp8_bf16(inp, weight, scale, quantization_group_size):
     if inp.dtype != torch.bfloat16:
         raise TypeError("matmul_fp8_bf16 requires BF16 activations")
-    return matmul_fp8_triton(inp, weight, scale, quantization_group_size)
+    return fp8_gemm_triton(inp, weight, scale, quantization_group_size)
 
 
 def matmul_fp8_fp16(inp, weight, scale, quantization_group_size):
     if inp.dtype != torch.float16:
         raise TypeError("matmul_fp8_fp16 requires FP16 activations")
-    return matmul_fp8_triton(inp, weight, scale, quantization_group_size)
+    return fp8_gemm_triton(inp, weight, scale, quantization_group_size)

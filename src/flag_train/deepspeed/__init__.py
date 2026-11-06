@@ -3,7 +3,7 @@
 from .blocked_flash import blocked_flash
 from .cuda_wf6af16_linear import cuda_wf6af16_linear
 from .evoformer_attn import evoformer_attn
-from .fp8_gemm_triton import matmul_fp8_triton
+from .fp8_gemm_triton import fp8_gemm_triton
 from .lamb import lamb
 from .mixed_gemm import mixed_gemm
 from .mixed_moe_gemm import mixed_moe_gemm
@@ -16,8 +16,8 @@ __all__ = [
     "blocked_flash",
     "cuda_wf6af16_linear",
     "evoformer_attn",
+    "fp8_gemm_triton",
     "lamb",
-    "matmul_fp8_triton",
     "mixed_gemm",
     "mixed_moe_gemm",
     "multi_tensor_adam",

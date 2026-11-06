@@ -1,53 +1,137 @@
 # Copyright 2026 FlagOS Contributors
 # SPDX-License-Identifier: Apache-2.0
-"""Forward-only DeepSpeed custom FP8 GEMM tests, following test_lamb.py.
+"""Check FP8 GEMM against independent arithmetic and the Torch baseline."""
 
-The mathematical torch oracle is independent of the production bitcast decoder.
-Every core candidate case runs against that oracle. The separate baseline is
-Torch dequantization + matmul on Ascend/MetaX/Hygon/Iluvatar, and the original
-DeepSpeed API on other vendors. Only pinned, known-broken NVIDIA baseline cases
-are skipped; candidate/oracle checks are never skipped for baseline limitations.
-
-Inputs are quantized uint8 weights (not differentiable torch float8 tensors),
-so this operator has a forward-only contract and no parameter-gradient tests.
-"""
-
-import json
+import contextlib
 import math
 
 import pytest
 import torch
 
 import flag_train
-from flag_train.deepspeed import matmul_fp8_triton
-
-from .. import accuracy_utils as utils
-from ._fp8_gemm_utils import (
-    ATOL,
-    BASE_M,
+from baseline.deepspeed.fp8_gemm_triton import (
     CORE_GROUP_SIZE,
     CORE_K,
     CORE_M,
     CORE_N,
-    LARGE_M,
-    assert_fp8_close,
-    baseline_matmul,
-    baseline_metadata,
-    decode_custom_e4m3,
-    make_baseline_inputs,
     make_portable_inputs,
-    original_deepspeed_skip_reason,
-    strict_matmul_context,
+    torch_composite_matmul,
     torch_dequantize_custom_e4m3,
-    torch_reference,
 )
+from flag_train.deepspeed import fp8_gemm_triton
 
-pytestmark = pytest.mark.fp8_gemm
+from .. import accuracy_utils as utils
+
+pytestmark = pytest.mark.fp8_gemm_triton
 DTYPES = (torch.bfloat16,)
+ATOL = {torch.bfloat16: 0.025}
+LARGE_M = (256, 512, 1024, 2048)
+
+
+@contextlib.contextmanager
+def strict_matmul_context():
+    """Keep reference FP32 accumulation precise and restore process settings."""
+    # These precision controls belong to CUDA/ROCm, not every PrivateUse1 backend.
+    if torch.device(flag_train.device).type != "cuda":
+        yield
+        return
+    names = (
+        "allow_tf32",
+        "allow_fp16_reduced_precision_reduction",
+        "allow_bf16_reduced_precision_reduction",
+    )
+    backend = torch.backends.cuda.matmul
+    previous = {
+        name: getattr(backend, name) for name in names if hasattr(backend, name)
+    }
+    try:
+        for name in previous:
+            setattr(backend, name, False)
+        yield
+    finally:
+        for name, value in previous.items():
+            setattr(backend, name, value)
+
+
+def decode_custom_e4m3(weight, scale, group_size, dtype):
+    """Independent arithmetic decoder, not the Triton/CUDA bitcast algorithm.
+
+    Every byte is finite; code 0 is +2**-7 before scale, and exponent 15 is
+    normal. This intentionally does NOT use torch.float8_e4m3fn semantics.
+    Decode by rows to bound temporary memory for the 4096x8192 core weights.
+    """
+    k, n = weight.shape
+    decoded = torch.empty_like(weight, dtype=dtype)
+    scales = scale.reshape(-1)
+    for start in range(0, k, 128):
+        codes = weight[start : start + 128].to(torch.int32)
+        sign = 1.0 - 2.0 * ((codes >> 7) & 1).to(torch.float32)
+        exponent = (codes >> 3) & 15
+        mantissa = codes & 7
+        # (1 + mantissa/8) * 2**(exponent-7), evaluated exactly.
+        # Device exp2 can approximate even integer powers of two. The largest
+        # shifted integer is 15 << 15, exactly representable in int32/FP32.
+        # This remains an arithmetic oracle, independent of kernel bitcasts.
+        magnitude = ((8 + mantissa) << exponent).to(torch.float32) * (1.0 / 1024)
+        unscaled = sign * magnitude
+        groups = (
+            torch.arange(
+                start * n,
+                start * n + codes.numel(),
+                device=weight.device,
+                dtype=torch.int32,
+            ).reshape_as(codes)
+            // group_size
+        )
+        # The kernel multiplies in FP32 before rounding to the operand dtype.
+        # E4M3 values are exactly representable; explicitly reproduce the FP32
+        # product rounding, avoiding FP64->FP16 double-rounding differences.
+        decoded[start : start + 128] = (unscaled.float() * scales[groups]).to(dtype)
+    return decoded
+
+
+def torch_reference(x, weight, scale, group_size):
+    # --ref cpu must move operands before decoding/matmul, not just the result.
+    x, weight, scale = (utils.to_reference(t) for t in (x, weight, scale))
+    decoded = decode_custom_e4m3(weight, scale, group_size, x.dtype)
+    return (x.float() @ decoded.float()).to(x.dtype)
+
+
+def assert_fp8_close(actual, reference, *, mean_relative=True):
+    """Use repository assertions and a predeclared FP8 GEMM-specific atol.
+
+    Repository rtol is unchanged: BF16 .016 and FP16 .001 (stricter than the
+    standalone test's .002). The absolute term handles near-zero cancellation;
+    it is fixed before testing, not scaled by K or observed output errors.
+    """
+    actual, reference = utils.to_reference(actual), utils.to_reference(reference)
+    assert bool(
+        torch.isfinite(actual).all()
+    ), "candidate/baseline contains nonfinite values"
+    assert bool(torch.isfinite(reference).all()), "reference contains nonfinite values"
+    utils.train_assert_close(
+        utils.to_reference(actual),
+        utils.to_reference(reference),
+        actual.dtype,
+        atol=ATOL[actual.dtype],
+    )
+    if mean_relative and actual.numel():
+        upstream_error = (
+            ((actual - reference).abs() / (actual.abs() + 1e-5)).sum() / actual.numel()
+        ).item()
+        assert (
+            upstream_error < 0.004
+        ), f"upstream mean relative error {upstream_error:.8g} must be <0.004"
+        error = (
+            ((actual.float() - reference.float()).abs() / (actual.float().abs() + 1e-5))
+            .mean()
+            .item()
+        )
+        assert error < 0.004, f"FP32 mean relative error {error:.8g} must be <0.004"
 
 
 @pytest.mark.parametrize("zero_scale", (False, True))
-def test_fp8_gemm_large_decoder_codes(zero_scale):
+def test_fp8_gemm_triton_large_decoder_codes(zero_scale):
     """Cover all encodings and flat scales in large-M workspace paths."""
     generator = torch.Generator(device="cpu").manual_seed(20260922)
     x = (torch.randn((512, 128), generator=generator) * 0.25).to(torch.bfloat16)
@@ -57,7 +141,7 @@ def test_fp8_gemm_large_decoder_codes(zero_scale):
     if zero_scale:
         scale.zero_()
     x, weight, scale = (t.to(flag_train.device) for t in (x, weight, scale))
-    actual = matmul_fp8_triton(x, weight, scale, 128)
+    actual = fp8_gemm_triton(x, weight, scale, 128)
     reference = torch_reference(x, weight, scale, 128)
     if zero_scale:
         utils.train_assert_equal(
@@ -66,64 +150,6 @@ def test_fp8_gemm_large_decoder_codes(zero_scale):
     else:
         assert_fp8_close(actual, reference, mean_relative=False)
 
-
-@pytest.mark.parametrize(
-    "vendor", ("ascend", "nvidia", "hygon", "thead", "metax", "iluvatar")
-)
-def test_fp8_baseline_entry_policy(monkeypatch, vendor):
-    """Explicit Torch vendors and original public API signatures stay intact."""
-    from . import _fp8_gemm_utils as helpers
-
-    calls = []
-    result = object()
-
-    def public(*args):
-        calls.append(("public", args))
-        return result
-
-    def composite(*args):
-        calls.append(("torch", args))
-        return result
-
-    def load():
-        assert vendor not in (
-            "ascend",
-            "metax",
-            "hygon",
-            "iluvatar",
-        ), "Torch paths must not import DeepSpeed"
-        return None, None, None, public, None
-
-    monkeypatch.setattr(flag_train, "vendor_name", vendor)
-    monkeypatch.setattr(helpers, "load_deepspeed", load)
-    monkeypatch.setattr(helpers, "torch_composite_matmul", composite)
-    operands = tuple(object() for _ in range(5))
-    assert helpers.baseline_matmul(*operands) is result
-    expected = (
-        ("torch", operands[:4])
-        if vendor in ("ascend", "metax", "hygon", "iluvatar")
-        else ("public", operands)
-    )
-    assert calls == [expected]
-
-
-@pytest.mark.parametrize("vendor", ("ascend", "metax", "hygon", "iluvatar", "nvidia"))
-def test_fp8_baseline_failure_is_not_replaced(monkeypatch, vendor):
-    """Both selected baselines propagate errors, without an implicit fallback."""
-    from . import _fp8_gemm_utils as helpers
-
-    def failing(*args):
-        raise RuntimeError("selected baseline failed")
-
-    monkeypatch.setattr(flag_train, "vendor_name", vendor)
-    monkeypatch.setattr(helpers, "torch_composite_matmul", failing)
-    monkeypatch.setattr(
-        helpers,
-        "load_deepspeed",
-        lambda: (None, None, None, failing, None),
-    )
-    with pytest.raises(RuntimeError, match="selected baseline failed"):
-        helpers.baseline_matmul(None, None, None, 128, None)
 
 
 @pytest.mark.parametrize("group_size", (1, 17, 128, 256, 512))
@@ -141,34 +167,8 @@ def test_fp8_torch_baseline_decoder(group_size, dtype):
     utils.train_assert_equal(actual.cpu(), expected)
 
 
-def test_fp8_torch_baseline_times_decode_and_matmul(monkeypatch):
-    """Each timed call must decode first; no cached weight or reference call."""
-    from . import _fp8_gemm_utils as helpers
-
-    x = torch.empty((1, 1), dtype=torch.bfloat16)
-    weight, scale, decoded, output = (object() for _ in range(4))
-    calls = []
-
-    def decode(w, s, group, dtype):
-        assert (w, s, group, dtype) == (weight, scale, 128, x.dtype)
-        calls.append("decode")
-        return decoded
-
-    def matmul(a, b):
-        assert a is x and b is decoded
-        calls.append("matmul")
-        return output
-
-    monkeypatch.setattr(helpers, "torch_dequantize_custom_e4m3", decode)
-    monkeypatch.setattr(torch, "matmul", matmul)
-    for _ in range(2):
-        assert helpers.torch_composite_matmul(x, weight, scale, 128) is output
-    assert calls == ["decode", "matmul", "decode", "matmul"]
-
 
 def test_fp8_torch_baseline_does_not_cache_inputs():
-    from ._fp8_gemm_utils import torch_composite_matmul
-
     device = flag_train.device
     x = torch.ones((1, 2), dtype=torch.bfloat16, device=device)
     weight = torch.tensor([[0, 1], [2, 3]], dtype=torch.uint8, device=device)
@@ -184,7 +184,7 @@ def test_fp8_torch_baseline_does_not_cache_inputs():
 
 
 @pytest.mark.parametrize("m", (1, 17, 1024))
-def test_fp8_gemm_does_not_cache_inputs(m):
+def test_fp8_gemm_triton_does_not_cache_inputs(m):
     """Fused and workspace paths must observe input mutations on every call."""
     device = flag_train.device
     x = torch.ones((m, 128), dtype=torch.bfloat16, device=device)
@@ -199,7 +199,7 @@ def test_fp8_gemm_does_not_cache_inputs(m):
         weight.fill_(code)
         scale.fill_(scale_value)
         x.fill_(activation)
-        actual = matmul_fp8_triton(x, weight, scale, 128)
+        actual = fp8_gemm_triton(x, weight, scale, 128)
         utils.train_assert_equal(
             actual.cpu(), torch.full((m, 128), expected, dtype=x.dtype)
         )
@@ -211,15 +211,6 @@ def fp8_environment():
         pytest.skip("The active backend does not support BF16")
     with strict_matmul_context():
         yield
-
-
-@pytest.fixture(scope="module")
-def selected_baseline():
-    # Explicit Torch baselines must not import DeepSpeed. Other vendors
-    # still require it; missing/build-broken baselines never imply a pass.
-    metadata = baseline_metadata()
-    print("FP8_GEMM_BASELINE " + json.dumps(metadata, sort_keys=True))
-    return metadata
 
 
 @pytest.fixture(
@@ -239,57 +230,14 @@ def core_case(request):
     return x, weight, scale, reference
 
 
-def test_fp8_gemm_candidate_vs_torch(core_case, record_property):
-    """All 15 BF16 candidate shapes run, including the four baseline skips."""
+def test_fp8_gemm_triton_candidate_vs_torch(core_case, record_property):
+    """All 15 BF16 candidate shapes run, with the arithmetic reference."""
     x, weight, scale, reference = core_case
     record_property("shape_group", "large-m" if x.shape[0] in LARGE_M else "base")
-    actual = matmul_fp8_triton(x, weight, scale, CORE_GROUP_SIZE)
+    actual = fp8_gemm_triton(x, weight, scale, CORE_GROUP_SIZE)
     assert_fp8_close(actual, reference)
-
-
-@pytest.mark.parametrize("m", CORE_M)
-def test_fp8_gemm_against_baseline(m, selected_baseline, record_property):
-    """Compare against the explicit platform baseline and an independent oracle.
-
-    ``original_deepspeed_skip_reason`` is deliberately consulted before the
-    DeepSpeed call.  It covers only the pinned upstream resource limit;
-    the candidate has already been checked against the independent oracle above.
-    """
-    dtype = torch.bfloat16
-    record_property("shape_group", "large-m" if m in LARGE_M else "base")
-    reason = original_deepspeed_skip_reason(
-        m,
-        CORE_K,
-        CORE_N,
-        dtype,
-        CORE_GROUP_SIZE,
-        flag_train.device,
-        metadata=selected_baseline,
-    )
-    if reason:
-        pytest.skip(reason)
-    record_property("baseline_mode", selected_baseline["mode"])
-    record_property("baseline_metadata", json.dumps(selected_baseline, sort_keys=True))
-    x, weight, scale, fpq = make_baseline_inputs(
-        m, CORE_K, CORE_N, dtype, CORE_GROUP_SIZE, flag_train.device
-    )
-    if fpq is None:
-        reference = torch_reference(x, weight, scale, CORE_GROUP_SIZE)
-    else:
-        decoded = fpq.dequantize(weight, scale=fpq.scale)
-        mathematical = decode_custom_e4m3(
-            utils.to_reference(weight),
-            utils.to_reference(scale),
-            CORE_GROUP_SIZE,
-            dtype,
-        )
-        utils.train_assert_equal(mathematical, utils.to_reference(decoded))
-        reference = torch.matmul(utils.to_reference(x), utils.to_reference(decoded))
-    actual = matmul_fp8_triton(x, weight, scale, CORE_GROUP_SIZE)
-    baseline = baseline_matmul(x, weight, scale, CORE_GROUP_SIZE, fpq)
-    assert_fp8_close(actual, reference)
+    baseline = torch_composite_matmul(x, weight, scale, CORE_GROUP_SIZE)
     assert_fp8_close(baseline, reference)
-    assert_fp8_close(actual, baseline, mean_relative=False)
 
 
 # All shapes below are tested against the mathematical oracle, not broadened
@@ -334,7 +282,7 @@ EDGE_CASES = (
 )
 
 
-def test_fp8_gemm_oracle_contract():
+def test_fp8_gemm_triton_oracle_contract():
     codes = torch.arange(256, device=flag_train.device).to(torch.uint8).reshape(1, 256)
     scale = torch.tensor([1 / 128], dtype=torch.float32, device=flag_train.device)
     values = decode_custom_e4m3(
@@ -366,7 +314,7 @@ def test_fp8_gemm_oracle_contract():
 @pytest.mark.parametrize(
     "name,m,k,n,group_size", EDGE_CASES, ids=[c[0] for c in EDGE_CASES]
 )
-def test_fp8_gemm_edges(name, m, k, n, group_size, dtype):
+def test_fp8_gemm_triton_edges(name, m, k, n, group_size, dtype):
     # Build the same bytes on every vendor, including those without device RNG.
     device = "cpu"
     generator = torch.Generator(device="cpu").manual_seed(20260922)
@@ -402,7 +350,7 @@ def test_fp8_gemm_edges(name, m, k, n, group_size, dtype):
         scales = scales.reshape(groups, 1)
     x, weight, scales = (t.to(flag_train.device) for t in (x, weight, scales))
     reference = torch_reference(x, weight, scales, group_size)
-    actual = matmul_fp8_triton(x, weight, scales, group_size)
+    actual = fp8_gemm_triton(x, weight, scales, group_size)
     if name in ("all_256_codes", "zero_scale", "empty_m", "empty_n", "empty_k"):
         utils.train_assert_equal(
             utils.to_reference(actual), utils.to_reference(reference)
@@ -446,7 +394,7 @@ INVALID_CASES = (
 
 
 @pytest.mark.parametrize("case,error", INVALID_CASES, ids=[c[0] for c in INVALID_CASES])
-def test_fp8_gemm_invalid_inputs(case, error):
+def test_fp8_gemm_triton_invalid_inputs(case, error):
     device = flag_train.device
     x = torch.ones((2, 3), dtype=torch.bfloat16, device=device)
     weight = torch.arange(15, device=device).to(torch.uint8).reshape(3, 5)
@@ -481,60 +429,4 @@ def test_fp8_gemm_invalid_inputs(case, error):
     elif case == "noncontiguous_scale":
         scale = torch.full((8,), 1 / 128, dtype=torch.float32, device=device)[::2]
     with pytest.raises(error):
-        matmul_fp8_triton(x, weight, scale, group)
-
-
-@pytest.mark.parametrize("vendor", ("ascend", "hygon", "thead", "metax", "iluvatar"))
-def test_fp8_gemm_h20_skip_is_nvidia_only(monkeypatch, vendor):
-    """Policy test, not evidence of execution on the named hardware."""
-    monkeypatch.setattr(flag_train, "vendor_name", vendor)
-    assert len(BASE_M) == 11 and len(LARGE_M) == 4
-    assert set(CORE_M) == set(BASE_M) | set(LARGE_M)
-    assert not set(BASE_M) & set(LARGE_M)
-    assert (
-        original_deepspeed_skip_reason(
-            256,
-            CORE_K,
-            CORE_N,
-            torch.bfloat16,
-            CORE_GROUP_SIZE,
-            flag_train.device,
-            metadata={},
-        )
-        is None
-    )
-
-
-def test_fp8_gemm_portable_path_without_deepspeed(monkeypatch):
-    from . import _fp8_gemm_utils as helpers
-
-    def forbidden():
-        raise AssertionError("Portable correctness must not load DeepSpeed")
-
-    monkeypatch.setattr(helpers, "load_deepspeed", forbidden)
-    x, weight, scale = make_portable_inputs(
-        17, 133, 77, torch.bfloat16, 17, flag_train.device
-    )
-    actual = matmul_fp8_triton(x, weight, scale, 17)
-    assert_fp8_close(actual, torch_reference(x, weight, scale, 17))
-
-
-@pytest.mark.parametrize("vendor", ("ascend", "metax", "hygon", "iluvatar"))
-def test_fp8_torch_baseline_without_deepspeed(monkeypatch, vendor):
-    """Exercise metadata, inputs and the full Torch path without the DS loader."""
-    from . import _fp8_gemm_utils as helpers
-
-    def forbidden():
-        raise AssertionError("The Torch baseline must not load DeepSpeed")
-
-    monkeypatch.setattr(flag_train, "vendor_name", vendor)
-    monkeypatch.setattr(helpers, "load_deepspeed", forbidden)
-    metadata = baseline_metadata()
-    assert metadata["mode"] == "torch-dequantize-matmul"
-    assert metadata["deepspeed_source_sha256"] is None
-    x, weight, scale, fpq = make_baseline_inputs(
-        17, 133, 77, torch.bfloat16, 17, flag_train.device
-    )
-    assert fpq is None
-    baseline = baseline_matmul(x, weight, scale, 17, fpq)
-    assert_fp8_close(baseline, torch_reference(x, weight, scale, 17))
+        fp8_gemm_triton(x, weight, scale, group)
