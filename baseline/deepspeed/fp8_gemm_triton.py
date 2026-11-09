@@ -1,9 +1,6 @@
 # Copyright 2026 FlagOS Contributors
 # SPDX-License-Identifier: Apache-2.0
-"""FP8 GEMM baseline: eager Torch decodes custom E4M3 and multiplies."""
-
-import functools
-import math
+"""Collect the baseline from DeepSpeed's native Triton FP8 GEMM."""
 
 import torch
 
@@ -28,61 +25,13 @@ def make_portable_inputs(m, k, n, dtype, group_size, device):
     return x.to(device), weight.to(device), scale.to(device)
 
 
-@functools.lru_cache(maxsize=16)
-def _custom_e4m3_codebook(device):
-    """Immutable format constants only; never cache input weights or indices."""
-    return torch.tensor(
-        [
-            math.ldexp(
-                (-1.0 if code & 128 else 1.0) * (8 + (code & 7)),
-                ((code >> 3) & 15) - 10,
-            )
-            for code in range(256)
-        ],
-        dtype=torch.float32,
-        device=device,
-    )
-
-
-def torch_dequantize_custom_e4m3(weight, scale, group_size, dtype):
-    """Vectorized Torch eager format lookup, separate from the arithmetic oracle.
-
-    All 256 codes are finite, including exponent zero/15. Cache only the fixed
-    1 KiB format table, not decoded/scaled weights, input-derived indices or
-    outputs. Each call reads every input byte and performs lookup and scaling.
-    Full groups use broadcast scaling, with a separate final partial group.
-    No per-call host transfers, scalar reads, compilation or Python row loop.
-    """
-    indices = weight.reshape(-1).to(torch.int32)
-    values = torch.index_select(_custom_e4m3_codebook(weight.device), 0, indices)
-    scales = scale.reshape(-1)
-    full, tail = divmod(weight.numel(), group_size)
-    if not tail:
-        scaled = values.reshape(full, group_size) * scales.reshape(-1, 1)
-    else:
-        prefix = values[: full * group_size].reshape(full, group_size)
-        prefix = (prefix * scales[:full].reshape(-1, 1)).reshape(-1)
-        suffix = values[full * group_size :] * scales[full]
-        scaled = torch.cat((prefix, suffix))
-    return scaled.reshape(weight.shape).to(dtype)
-
-
-def torch_composite_matmul(x, weight, scale, group_size):
-    """Timed baseline: decode/scale/round afresh, then native-dtype matmul.
-
-    This deliberately does not call torch_reference: that independent oracle
-    uses chunked arithmetic and FP32 matmul (and optionally CPU transfers).
-    """
-    decoded = torch_dequantize_custom_e4m3(weight, scale, group_size, x.dtype)
-    return torch.matmul(x, decoded)
-
-
-def base_op():
-    return torch_composite_matmul
-
-
 def native():
-    return base_op()
+    """Resolve DeepSpeed's FP8 GEMM; fail if the native collector cannot load it."""
+    try:
+        from deepspeed.ops.fp_quantizer.fp8_gemm_triton import matmul_fp8_triton
+    except Exception as exc:
+        raise RuntimeError(f"Cannot load DeepSpeed's Triton FP8 GEMM: {exc!r}") from exc
+    return matmul_fp8_triton
 
 
 def grid():

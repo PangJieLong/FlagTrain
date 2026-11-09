@@ -3,10 +3,13 @@
 """Check FP8 GEMM through its public interface against independent arithmetic."""
 
 import contextlib
+import functools
 import math
+import warnings
 
 import pytest
 import torch
+from triton.runtime.errors import OutOfResources
 
 import flag_train
 
@@ -101,6 +104,35 @@ def torch_reference(x, weight, scale, group_size):
     x, weight, scale = (utils.to_reference(t) for t in (x, weight, scale))
     decoded = decode_custom_e4m3(weight, scale, group_size, x.dtype)
     return (x.float() @ decoded.float()).to(x.dtype)
+
+
+@functools.lru_cache(maxsize=1)
+def _load_deepspeed_fp8_gemm():
+    try:
+        from deepspeed.ops.fp_quantizer.fp8_gemm_triton import matmul_fp8_triton
+    except Exception as exc:
+        warnings.warn(
+            f"DeepSpeed FP8 GEMM could not be loaded: {exc!r}; using Torch.",
+            stacklevel=2,
+        )
+        return None
+    return matmul_fp8_triton
+
+
+def core_reference(x, weight, scale, group_size):
+    # Honor --ref=cpu. Edge tests use the arithmetic reference for layouts
+    # outside the upstream kernel's aligned BF16 contract.
+    upstream = None if utils.TO_CPU else _load_deepspeed_fp8_gemm()
+    if upstream is not None:
+        try:
+            return upstream(x, weight, scale, group_size), "deepspeed"
+        except (OutOfResources, NotImplementedError) as exc:
+            warnings.warn(
+                f"DeepSpeed FP8 GEMM unavailable for {tuple(x.shape)}: "
+                f"{exc!r}; using Torch.",
+                stacklevel=2,
+            )
+    return torch_reference(x, weight, scale, group_size), "torch"
 
 
 def assert_fp8_close(actual, reference, *, mean_relative=True):
@@ -200,13 +232,14 @@ def core_case(request):
     x, weight, scale = make_test_inputs(
         m, CORE_K, CORE_N, dtype, CORE_GROUP_SIZE, flag_train.device
     )
-    reference = torch_reference(x, weight, scale, CORE_GROUP_SIZE)
-    return x, weight, scale, reference
+    reference, reference_name = core_reference(x, weight, scale, CORE_GROUP_SIZE)
+    return x, weight, scale, reference, reference_name
 
 
-def test_fp8_gemm_triton_candidate_vs_torch(core_case, record_property):
-    """All 15 BF16 candidate shapes run, with the arithmetic reference."""
-    x, weight, scale, reference = core_case
+def test_fp8_gemm_triton_candidate_vs_reference(core_case, record_property):
+    """Prefer DeepSpeed for the aligned BF16 shapes."""
+    x, weight, scale, reference, reference_name = core_case
+    record_property("reference", reference_name)
     record_property("shape_group", "large-m" if x.shape[0] in LARGE_M else "base")
     actual = flag_train.deepspeed.fp8_gemm_triton(x, weight, scale, CORE_GROUP_SIZE)
     assert_fp8_close(actual, reference)

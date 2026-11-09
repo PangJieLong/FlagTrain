@@ -192,15 +192,3 @@ def fp8_gemm_triton(inp, weight, scale, quantization_group_size):
     logger.debug("TRAIN FP8_GEMM_TRITON")
     _validate(inp, weight, scale, quantization_group_size)
     return _launch(inp, weight, scale, quantization_group_size)
-
-
-def matmul_fp8_bf16(inp, weight, scale, quantization_group_size):
-    if inp.dtype != torch.bfloat16:
-        raise TypeError("matmul_fp8_bf16 requires BF16 activations")
-    return fp8_gemm_triton(inp, weight, scale, quantization_group_size)
-
-
-def matmul_fp8_fp16(inp, weight, scale, quantization_group_size):
-    if inp.dtype != torch.float16:
-        raise TypeError("matmul_fp8_fp16 requires FP16 activations")
-    return fp8_gemm_triton(inp, weight, scale, quantization_group_size)

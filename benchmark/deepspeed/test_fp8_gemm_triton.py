@@ -1,12 +1,14 @@
 # Copyright 2026 FlagOS Contributors
 # SPDX-License-Identifier: Apache-2.0
-"""Benchmark FP8 GEMM against eager Torch dequantization and matmul."""
+"""Benchmark FP8 GEMM against DeepSpeed, with an eager Torch fallback."""
 
 import functools
 import math
+import warnings
 
 import pytest
 import torch
+from triton.runtime.errors import OutOfResources
 
 import flag_train
 
@@ -77,6 +79,19 @@ def torch_composite_matmul(x, weight, scale, group_size):
     return torch.matmul(x, decoded)
 
 
+@functools.lru_cache(maxsize=1)
+def _load_deepspeed_fp8_gemm():
+    try:
+        from deepspeed.ops.fp_quantizer.fp8_gemm_triton import matmul_fp8_triton
+    except Exception as exc:
+        warnings.warn(
+            f"DeepSpeed FP8 GEMM could not be loaded: {exc!r}; using Torch.",
+            stacklevel=2,
+        )
+        return None
+    return matmul_fp8_triton
+
+
 class Fp8GemmBenchmark(base.GenericBenchmark):
     DEFAULT_SHAPE_DESC = "M, K, N"
 
@@ -87,7 +102,28 @@ class Fp8GemmBenchmark(base.GenericBenchmark):
         return []
 
     def _measure_input(self, inputs, case_id=None):
-        metric = super()._measure_input(inputs, case_id=case_id)
+        previous_op = self.torch_op
+        if "latency_base" in self.to_bench_metrics and not base.Config.skip_native:
+            args, kwargs = self.unpack_to_args_kwargs(inputs)
+            upstream = _load_deepspeed_fp8_gemm()
+            if upstream is not None:
+                # Probe this exact shape outside timing; large tiles may not fit.
+                try:
+                    upstream(*args, **kwargs)
+                except (OutOfResources, NotImplementedError) as exc:
+                    warnings.warn(
+                        f"DeepSpeed FP8 GEMM unavailable for {tuple(args[0].shape)}: "
+                        f"{exc!r}; using Torch.",
+                        stacklevel=2,
+                    )
+                else:
+                    self.torch_op = upstream
+            reference = "DeepSpeed" if self.torch_op is upstream else "Torch"
+            print(f"FP8 GEMM baseline {tuple(args[0].shape)}: {reference}")
+        try:
+            metric = super()._measure_input(inputs, case_id=case_id)
+        finally:
+            self.torch_op = previous_op
         assert metric.error_msg is None, f"{case_id}: {metric.error_msg}"
         if metric.speedup is not None:
             label = case_id or metric.shape_detail
