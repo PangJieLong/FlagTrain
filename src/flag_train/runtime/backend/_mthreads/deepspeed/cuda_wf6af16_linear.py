@@ -44,7 +44,7 @@ cuda_wf6af16_linear_kernel = libentry()(
 )
 
 
-def wf6af16_linear(
+def cuda_wf6af16_linear(
     output,
     hidden_states,
     weights_2bit,
