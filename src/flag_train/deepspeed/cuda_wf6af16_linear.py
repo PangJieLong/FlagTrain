@@ -53,7 +53,7 @@ from flag_train.utils import triton_lang_extension as tle
 logger = logging.getLogger(__name__)
 
 
-def _gemm_configs(num_stages=None):
+def _gemm_configs():
     """Autotune candidates for the GEMM kernel.
 
     Small-``BLOCK_N`` entries serve the decode shapes (few tokens, where the
@@ -86,7 +86,7 @@ def _gemm_configs(num_stages=None):
             triton.Config(
                 {"BLOCK_M": block_m, "BLOCK_N": block_n, "BLOCK_K": block_k},
                 num_warps=warps,
-                num_stages=stages if num_stages is None else num_stages,
+                num_stages=stages,
             )
         )
     return configs
@@ -474,34 +474,6 @@ def cuda_wf6af16_linear(
         Tensor: ``output``.
     """
     logger.debug("TRAIN CUDA_WF6AF16_LINEAR")
-    return _launch_cuda_wf6af16_linear(
-        cuda_wf6af16_linear_kernel,
-        output,
-        hidden_states,
-        weights_2bit,
-        weights_4bit,
-        scale,
-        out_channels,
-        tokens,
-        in_channels,
-        split_k,
-        wide_load,
-    )
-
-
-def _launch_cuda_wf6af16_linear(
-    gemm_kernel,
-    output,
-    hidden_states,
-    weights_2bit,
-    weights_4bit,
-    scale,
-    out_channels,
-    tokens,
-    in_channels,
-    split_k,
-    wide_load,
-):
 
     assert hidden_states.dtype == torch.float16, "activations must be fp16"
     assert output.dtype == torch.float16, "output must be fp16"
@@ -560,7 +532,7 @@ def _launch_cuda_wf6af16_linear(
 
     with torch_device_fn.device(hidden_states.device):
         if split_k == 1:
-            gemm_kernel[grid](
+            cuda_wf6af16_linear_kernel[grid](
                 output,
                 hidden_states,
                 weights_2bit,
@@ -579,7 +551,7 @@ def _launch_cuda_wf6af16_linear(
                 dtype=torch.float32,
                 device=hidden_states.device,
             )
-            gemm_kernel[grid](
+            cuda_wf6af16_linear_kernel[grid](
                 workspace,
                 hidden_states,
                 weights_2bit,
